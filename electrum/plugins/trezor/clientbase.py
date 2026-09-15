@@ -13,7 +13,7 @@ from electrum.hw_wallet.plugin import OutdatedHwFirmwareException, HardwareClien
 
 from trezorlib.client import TrezorClient, PassphraseSetting, AppManifest, get_client
 from trezorlib.exceptions import TrezorFailure, Cancelled, OutdatedFirmwareError
-from trezorlib.messages import WordRequestType, FailureType, ButtonRequestType, Capability, Features
+from trezorlib.messages import WordRequestType, FailureType, ButtonRequestType, Capability, Features, ApplyFlags, Success
 from trezorlib import models
 from trezorlib.thp.pairing import CodeEntry, ControllerLifecycle
 import trezorlib.btc
@@ -110,7 +110,7 @@ class TrezorClientBase(HardwareClientBase, Logger):
         if self._session is None:
             assert self.handler is not None, "No UI handler for session"
             self.pair_if_needed()
-            self.client.ensure_unlocked()  # unlock device so features are populated and we know about passphrase
+            self._ensure_unlocked()  # unlock device so features are populated and we know about passphrase
 
             features = self.client.features
             if not features.passphrase_protection:
@@ -125,6 +125,22 @@ class TrezorClientBase(HardwareClientBase, Logger):
             self.logger.info(f"Opened {self._session} ({features.passphrase_protection=}, on_device={passphrase is PassphraseSetting.ON_DEVICE})")
 
         return self._session
+
+    def _ensure_unlocked(self) -> None:
+        """Unlock the device (PIN entry if needed) without deriving a seed.
+
+        trezorlib 0.20.1 client.ensure_unlocked() derives a throwaway standard-wallet
+        session for this. With passphrase_always_on_device, protocol v1 devices then
+        prompt for the passphrase on-device, and again for the real session (so it has
+        to be entered twice), while THP devices reject the empty passphrase (DataError).
+        This does what client.ensure_unlocked() does since trezorlib 0.20.2.
+        """
+        if not self.client.features.initialized:
+            return  # uninitialized device cannot be locked
+        with self.client.get_session(passphrase=None) as seedless_session:
+            # ApplyFlags(flags=0) is a no-op but needs the device unlocked; it does not derive the seed
+            seedless_session.call(ApplyFlags(flags=0), expect=Success)
+        self.client.refresh_features()
 
     def run_flow(self, message=None, creating_wallet=False):
         if self.in_flow:

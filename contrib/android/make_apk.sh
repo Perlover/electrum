@@ -49,6 +49,7 @@ info "apk building phase starts."
 #
 # Testnet4
 #export APP_PACKAGE_DOMAIN=org.electrum.testnet4
+export APP_PACKAGE_DOMAIN=org.electrum.routingtest
 
 if [ $CI ]; then
     # override log level specified in buildozer.spec to "debug":

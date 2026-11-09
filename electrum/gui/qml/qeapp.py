@@ -5,6 +5,7 @@ import os
 import sys
 import html
 import threading
+import pathlib
 from functools import partial
 from typing import TYPE_CHECKING, Set, List, Optional, Callable
 
@@ -16,7 +17,7 @@ from PyQt6.QtQml import qmlRegisterType, QQmlApplicationEngine
 import electrum
 from electrum import version, constants
 from electrum.i18n import _
-from electrum.logging import Logger, get_logger
+from electrum.logging import Logger, get_logger, read_latest_logs
 from electrum.bip21 import BITCOIN_BIP21_URI_SCHEME, LIGHTNING_URI_SCHEME
 from electrum.base_crash_reporter import BaseCrashReporter, EarlyExceptionsQueue
 from electrum.network import Network
@@ -71,6 +72,7 @@ notification = None
 class QEAppController(BaseCrashReporter, QObject):
     _dummy = pyqtSignal()
     userNotify = pyqtSignal(str, str)
+    _logsReadyForExport = pyqtSignal(str, str)  # text, error
     uriReceived = pyqtSignal(str)
     showException = pyqtSignal('QVariantMap')
     sendingBugreport = pyqtSignal()
@@ -109,6 +111,8 @@ class QEAppController(BaseCrashReporter, QObject):
         QEDaemon.instance.walletLoaded.connect(self.on_wallet_loaded)
 
         self.userNotify.connect(self.doNotify)
+        self._is_exporting_logs = False
+        self._logsReadyForExport.connect(self._on_logs_ready_for_export)
 
         if self.isAndroid():
             self.bindIntent()
@@ -310,6 +314,68 @@ class QEAppController(BaseCrashReporter, QObject):
         sendIntent.putExtra(jIntent.EXTRA_TEXT, jString(data))
         it = jIntent.createChooser(sendIntent, cast('java.lang.CharSequence', jString(title)))
         jpythonActivity.startActivity(it)
+
+    @pyqtSlot(result=bool)
+    def canExportLogs(self) -> bool:
+        return self.isAndroid() and systemSdkVersion >= 29  # MediaStore.Downloads needs API 29
+
+    @pyqtSlot()
+    def exportLogs(self):
+        """Saves the end of the logs to a text file in Downloads, and offers to share it."""
+        if self._is_exporting_logs or not self.canExportLogs():
+            return
+        self._is_exporting_logs = True
+        log_directory = pathlib.Path(self.config.path) / "logs"
+
+        def task():  # log files can be big, so do not block the GUI
+            try:
+                self._logsReadyForExport.emit(read_latest_logs(log_directory), '')
+            except Exception as e:
+                self.logger.exception('failed to read logs')
+                self._logsReadyForExport.emit('', repr(e))
+        threading.Thread(target=task, daemon=True, name='export-logs').start()
+
+    def _on_logs_ready_for_export(self, text: str, error: str):
+        self._is_exporting_logs = False
+        if error:
+            self.userNotify.emit('', _('Could not read the logs') + f': {error}')
+            return
+        if not text:
+            self.userNotify.emit('', _('There are no logs yet. Enable writing logs to file and restart Electrum.'))
+            return
+        filename = f'electrum-logs-{time.strftime("%Y%m%d-%H%M%S")}.txt'
+        try:
+            uri = self._save_text_to_downloads(filename, text)
+            send_intent = jIntent()
+            send_intent.setAction(jIntent.ACTION_SEND)
+            send_intent.setType('text/plain')
+            send_intent.putExtra(jIntent.EXTRA_STREAM, cast('android.os.Parcelable', uri))
+            send_intent.addFlags(jIntent.FLAG_GRANT_READ_URI_PERMISSION)
+            chooser = jIntent.createChooser(send_intent, cast('java.lang.CharSequence', jString(_('Share logs'))))
+            chooser.addFlags(jIntent.FLAG_GRANT_READ_URI_PERMISSION)
+            jpythonActivity.startActivity(chooser)
+        except Exception as e:
+            self.logger.exception('failed to export logs')
+            self.userNotify.emit('', _('Could not save the logs') + f': {e!r}')
+            return
+        self.userNotify.emit('', _('Logs saved to Downloads') + f': {filename}')
+
+    @staticmethod
+    def _save_text_to_downloads(filename: str, text: str):
+        """Creates a text file in the public Downloads folder, and returns its content URI."""
+        jMediaStoreDownloads = autoclass('android.provider.MediaStore$Downloads')
+        jContentValues = autoclass('android.content.ContentValues')
+        values = jContentValues()
+        values.put('_display_name', filename)
+        values.put('mime_type', 'text/plain')
+        resolver = jpythonActivity.getContentResolver()
+        uri = resolver.insert(jMediaStoreDownloads.EXTERNAL_CONTENT_URI, values)
+        if uri is None:
+            raise Exception('could not create the file')
+        pfd = resolver.openFileDescriptor(uri, 'w')
+        with os.fdopen(pfd.detachFd(), 'wb') as f:
+            f.write(text.encode('utf-8'))
+        return uri
 
     @pyqtSlot(result=bool)
     def isMaxBrightnessOnQrDisplayEnabled(self):

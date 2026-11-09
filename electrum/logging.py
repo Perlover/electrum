@@ -117,23 +117,25 @@ class TruncatingMemoryHandler(logging.handlers.MemoryHandler):
         super().close()
 
 
+def _logfile_sortkey_oldest_first(p: pathlib.PurePath):
+    fname = p.name
+    basename, ext, counter = str(fname).partition(".log")
+    # - each time electrum is launched, there will be a new basename, ordered by date
+    # - for any given basename, there might be multiple log files, differing by counter
+    #   - empty counter is newest, then .1 is older, .2 is even older, etc
+    try:
+        counter = int(counter[1:]) if counter else 0  # convert ".2" -> 2
+    except ValueError:
+        _logger.warning(f"failed to parse log file name: {fname}")
+        counter = 0
+    return basename, -counter
+
+
 def _delete_old_logs(path, *, num_files_keep: int, max_total_size: int):
     """Delete old logfiles, only keeping the latest few."""
-    def sortkey_oldest_first(p: pathlib.PurePath):
-        fname = p.name
-        basename, ext, counter = str(fname).partition(".log")
-        # - each time electrum is launched, there will be a new basename, ordered by date
-        # - for any given basename, there might be multiple log files, differing by counter
-        #   - empty counter is newest, then .1 is older, .2 is even older, etc
-        try:
-            counter = int(counter[1:]) if counter else 0  # convert ".2" -> 2
-        except ValueError:
-            _logger.warning(f"failed to parse log file name: {fname}")
-            counter = 0
-        return basename, -counter
     files = sorted(
         list(pathlib.Path(path).glob("electrum_log_*.log*")),
-        key=sortkey_oldest_first,
+        key=_logfile_sortkey_oldest_first,
     )
     total_size = sum(os.stat(f).st_size for f in files)  # in bytes
     num_files_remaining = len(files)
@@ -147,6 +149,35 @@ def _delete_old_logs(path, *, num_files_keep: int, max_total_size: int):
             os.remove(f)
         except OSError as e:
             _logger.warning(f"cannot delete old logfile: {e}")
+
+
+def read_latest_logs(log_directory: pathlib.Path, *, max_size: int = 5_000_000) -> str:
+    """Returns the end of the logs in log_directory, at most max_size bytes, oldest line first."""
+    files = sorted(
+        pathlib.Path(log_directory).glob("electrum_log_*.log*"),
+        key=_logfile_sortkey_oldest_first,
+        reverse=True,
+    )
+    chunks = []  # newest first
+    remaining = max_size
+    for f in files:
+        if remaining <= 0:
+            break
+        try:
+            with open(f, "rb") as fd:
+                size = os.fstat(fd.fileno()).st_size
+                to_read = min(size, remaining)
+                fd.seek(size - to_read)
+                data = fd.read(to_read)
+        except OSError as e:
+            _logger.warning(f"cannot read logfile: {e}")
+            continue
+        chunks.append(data)
+        remaining -= len(data)
+    data = b"".join(reversed(chunks))
+    if remaining <= 0:  # the first line might be cut in half
+        data = data[data.find(b"\n") + 1:]
+    return data.decode("utf-8", "replace")
 
 
 _logfile_path = None

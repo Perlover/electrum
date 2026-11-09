@@ -489,6 +489,42 @@ Pane {
                             wrapMode: Text.Wrap
                         }
                     }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        Switch {
+                            id: writeLogsToDisk
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.writeLogsToDisk = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Write logs to file (takes effect after a restart)')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    Button {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        visible: AppController.canExportLogs()
+                        text: qsTr('Export logs')
+                        onClicked: {
+                            var dialog = app.messageDialog.createObject(app, {
+                                title: qsTr('Export logs'),
+                                text: qsTr('The log file will be saved to your Downloads folder. Logs can contain private information, such as addresses, amounts and channel details. Only share them with someone you trust.'),
+                                yesno: true
+                            })
+                            dialog.accepted.connect(function() {
+                                AppController.exportLogs()
+                            })
+                            dialog.open()
+                        }
+                    }
                 }
             }
         }
@@ -506,6 +542,7 @@ Pane {
         freezeReusedAddressUtxos.checked = Config.freezeReusedAddressUtxos
         useTrampolineRouting.checked = !Config.useGossip
         enableDebugLogs.checked = Config.enableDebugLogs
+        writeLogsToDisk.checked = Config.writeLogsToDisk
         disableScreenshots.checked = !Config.alwaysAllowScreenshots && AppController.isAndroid()
         setMaxBrightnessOnQrDisplay.checked = Config.setMaxBrightnessOnQrDisplay && AppController.isAndroid()
         useRecoverableChannels.checked = Config.useRecoverableChannels

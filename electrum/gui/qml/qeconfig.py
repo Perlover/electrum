@@ -181,6 +181,16 @@ class QEConfig(AuthMixin, QObject):
         self.config.LIGHTNING_USE_GOSSIP = gossip
         self.useGossipChanged.emit()
 
+    writeLogsToDiskChanged = pyqtSignal()
+    @pyqtProperty(bool, notify=writeLogsToDiskChanged)
+    def writeLogsToDisk(self):
+        return self.config.WRITE_LOGS_TO_DISK
+
+    @writeLogsToDisk.setter
+    def writeLogsToDisk(self, enable):
+        self.config.WRITE_LOGS_TO_DISK = enable
+        self.writeLogsToDiskChanged.emit()
+
     enableDebugLogsChanged = pyqtSignal()
     @pyqtProperty(bool, notify=enableDebugLogsChanged)
     def enableDebugLogs(self):

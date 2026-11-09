@@ -68,9 +68,63 @@ if 'ANDROID_DATA' in os.environ:
 notification = None
 
 
+def _collect_routing_log(
+    log_dir: str, *,
+    max_files: int = 3,
+    max_read_per_file: int = 8_000_000,
+    max_output: int = 2_000_000,
+) -> str:
+    """test build only: returns the lines about lightning payments, from the end of the newest logs."""
+    import glob
+    pattern = re.compile('|'.join(re.escape(p) for p in (
+        'UPDATE_FAIL_HTLC', 'error reported by', 'report ', 'pay_to_node', 'pay_invoice', 'trying split',
+        'rejecting route', 'payment failure', 'Giving up', 'gossip_db status', 'suggest_split',
+        'requesting channel graph', 'Received ', 'Deleting ', 'ignoring its channel range')))
+    files = sorted(glob.glob(os.path.join(log_dir, '*.log*')), key=os.path.getmtime, reverse=True)[:max_files]
+    lines = []  # oldest first
+    for fn in reversed(files):
+        try:
+            with open(fn, 'rb') as f:
+                size = os.path.getsize(fn)
+                if size > max_read_per_file:
+                    f.seek(size - max_read_per_file)
+                    f.readline()  # skip the partial line
+                data = f.read()
+        except OSError:
+            continue
+        for i, line in enumerate(data.decode('utf-8', 'replace').splitlines(keepends=True)):
+            if pattern.search(line):
+                lines.append(line)
+            if i % 2000 == 0:
+                time.sleep(0.001)  # let the GUI thread run
+    text = ''.join(lines)
+    if len(text) > max_output:
+        text = text[-max_output:]
+        text = text[text.find('\n') + 1:]  # start at a whole line
+    return text or f'no matching log lines yet (log dir: {log_dir})'
+
+
+def _save_text_to_downloads(filename: str, text: str):
+    """test build only: creates a text file in the public Downloads folder. returns its content uri."""
+    jMediaDownloads = autoclass('android.provider.MediaStore$Downloads')
+    jContentValues = autoclass('android.content.ContentValues')
+    values = jContentValues()
+    values.put('_display_name', filename)
+    values.put('mime_type', 'text/plain')
+    resolver = jpythonActivity.getContentResolver()
+    uri = resolver.insert(jMediaDownloads.EXTERNAL_CONTENT_URI, values)
+    if uri is None:
+        raise Exception('could not create the file in Downloads')
+    pfd = resolver.openFileDescriptor(uri, 'w')
+    with os.fdopen(pfd.detachFd(), 'wb') as f:
+        f.write(text.encode('utf-8'))
+    return uri
+
+
 class QEAppController(BaseCrashReporter, QObject):
     _dummy = pyqtSignal()
     userNotify = pyqtSignal(str, str)
+    _routingLogReady = pyqtSignal(str, str)
     uriReceived = pyqtSignal(str)
     showException = pyqtSignal('QVariantMap')
     sendingBugreport = pyqtSignal()
@@ -109,6 +163,8 @@ class QEAppController(BaseCrashReporter, QObject):
         QEDaemon.instance.walletLoaded.connect(self.on_wallet_loaded)
 
         self.userNotify.connect(self.doNotify)
+        self._routing_log_busy = False
+        self._routingLogReady.connect(self._on_routing_log_ready)
 
         if self.isAndroid():
             self.bindIntent()
@@ -310,6 +366,50 @@ class QEAppController(BaseCrashReporter, QObject):
         sendIntent.putExtra(jIntent.EXTRA_TEXT, jString(data))
         it = jIntent.createChooser(sendIntent, cast('java.lang.CharSequence', jString(title)))
         jpythonActivity.startActivity(it)
+
+    @pyqtSlot()
+    def shareDebugRoutingLog(self):
+        """test build only: save the log lines about lightning payment failures to a file, and share it.
+        The log files can be big, so they are read in a thread, to not block the GUI.
+        """
+        if self._routing_log_busy:
+            return
+        self._routing_log_busy = True
+        log_dir = os.path.join(self.config.path, 'logs')
+
+        def task():
+            try:
+                self._routingLogReady.emit(_collect_routing_log(log_dir), '')
+            except Exception as e:
+                self.logger.exception('failed to collect the routing log')
+                self._routingLogReady.emit('', repr(e))
+        threading.Thread(target=task, daemon=True, name='routing-log').start()
+
+    def _on_routing_log_ready(self, text: str, error: str):
+        self._routing_log_busy = False
+        if error:
+            self.userNotify.emit('', f'Could not collect the log: {error}')
+            return
+        try:
+            filename = f'electrum-routing-log-{time.strftime("%Y%m%d-%H%M%S")}.txt'
+            if not self.isAndroid():
+                return
+            if systemSdkVersion < 29:  # no MediaStore.Downloads. share a small part as plain text instead
+                self.doShare(text[-100_000:], 'Electrum routing log')
+                return
+            uri = _save_text_to_downloads(filename, text)
+            self.userNotify.emit('', f'Saved to Downloads: {filename}')
+            sendIntent = jIntent()
+            sendIntent.setAction(jIntent.ACTION_SEND)
+            sendIntent.setType('text/plain')
+            sendIntent.putExtra(jIntent.EXTRA_STREAM, cast('android.os.Parcelable', uri))
+            sendIntent.addFlags(jIntent.FLAG_GRANT_READ_URI_PERMISSION)
+            it = jIntent.createChooser(sendIntent, cast('java.lang.CharSequence', jString('Electrum routing log')))
+            it.addFlags(jIntent.FLAG_GRANT_READ_URI_PERMISSION)
+            jpythonActivity.startActivity(it)
+        except Exception as e:
+            self.logger.exception('failed to save the routing log')
+            self.userNotify.emit('', f'Could not save the log: {e!r}')
 
     @pyqtSlot(result=bool)
     def isMaxBrightnessOnQrDisplayEnabled(self):

@@ -79,7 +79,8 @@ def _collect_routing_log(
     pattern = re.compile('|'.join(re.escape(p) for p in (
         'UPDATE_FAIL_HTLC', 'error reported by', 'report ', 'pay_to_node', 'pay_invoice', 'trying split',
         'rejecting route', 'payment failure', 'Giving up', 'gossip_db status', 'suggest_split',
-        'requesting channel graph', 'Received ', 'Deleting ', 'ignoring its channel range')))
+        'requesting channel graph', 'Received ', 'Deleting ', 'ignoring its channel range',
+        'sent htlc', 'htlc failed', 'htlc succeeded', 'found a path', 'applied channel update')))
     files = sorted(glob.glob(os.path.join(log_dir, '*.log*')), key=os.path.getmtime, reverse=True)[:max_files]
     lines = []  # oldest first
     for fn in reversed(files):

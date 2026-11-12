@@ -83,7 +83,7 @@ from .lnonion import (
 from .lnmsg import decode_msg
 from .lnrouter import (
     RouteEdge, LNPaymentRoute, LNPaymentPath, is_route_within_budget, NoChannelPolicy,
-    LNPathInconsistent, fee_for_edge_msat,
+    LNPathInconsistent, fee_for_edge_msat, local_scid_for_route_hint,
 )
 from .lnwatcher import LNWatcher
 from .submarine_swaps import SwapManager
@@ -955,6 +955,11 @@ def _age_for_log(timestamp: Optional[int], *, now: Optional[int] = None) -> str:
     if seconds < 2 * 86400:
         return f'{seconds // 3600}h'
     return f'{seconds // 86400}d'
+
+
+def _scid_for_log(edge: 'RouteEdge') -> 'ShortChannelID':
+    """the scid the network knows (a route hint may have a local one, see local_scid_for_route_hint)"""
+    return edge.onion_short_channel_id or edge.short_channel_id
 
 
 def _route_fee_msat(route: 'LNPaymentRoute', amount_msat: int) -> int:
@@ -2306,7 +2311,7 @@ class LNWallet(Logger):
         self.logger.info(f"error reported by {erring_node_id.hex()}")
         if not self.uses_trampoline():  # note: with trampoline, sender_idx is about the trampoline route
             failing_edge = sender_idx + 1
-            where = (f"at edge {failing_edge + 1} of {len(route)} (channel {route[failing_edge].short_channel_id})"
+            where = (f"at edge {failing_edge + 1} of {len(route)} (channel {_scid_for_log(route[failing_edge])})"
                      if failing_edge < len(route) else "at the destination")
             self.logger.info(f"htlc failed {where}. route: {self._route_to_str_for_log(route, with_source=False)}")
         if code == OnionFailureCode.MPP_TIMEOUT:
@@ -2398,7 +2403,7 @@ class LNWallet(Logger):
             elif self.channel_db is None:
                 source = ''
             else:
-                policy = self.channel_db.get_policy_for_node(edge.short_channel_id, edge.start_node)
+                policy = self.channel_db.get_policy_for_node(_scid_for_log(edge), edge.start_node)
                 if policy is None or not policy.timestamp:
                     source = 'route hint'
                 elif (policy.fee_base_msat, policy.fee_proportional_millionths, policy.cltv_delta) \
@@ -2407,7 +2412,7 @@ class LNWallet(Logger):
                 else:
                     source = f'update {_age_for_log(policy.timestamp, now=now)} old'
             parts.append(
-                f"{edge.start_node.hex()[:10]} -[{edge.short_channel_id} "
+                f"{edge.start_node.hex()[:10]} -[{_scid_for_log(edge)} "
                 f"{edge.fee_base_msat}+{edge.fee_proportional_millionths}ppm cltv {edge.cltv_delta}"
                 + (f", {source}" if source else "") + "]->")
         parts.append(route[-1].end_node.hex()[:10] if route else '')
@@ -2439,6 +2444,8 @@ class LNWallet(Logger):
         }
         try:
             failing_channel = route[sender_idx + 1].short_channel_id
+            # the channel_update names the scid of the onion
+            update_scid = route[sender_idx + 1].onion_short_channel_id or failing_channel
         except IndexError:
             raise PaymentFailure(f'payment destination reported error: {failure_msg.code_name()}') from None
 
@@ -2458,7 +2465,7 @@ class LNWallet(Logger):
                 self.logger.info(f'could not decode channel_update for failed htlc: '
                                  f'{channel_update_as_received.hex()}')
                 blacklist = True
-            elif payload.get('short_channel_id') != failing_channel:
+            elif payload.get('short_channel_id') != update_scid:
                 self.logger.info(f'short_channel_id in channel_update does not match our route')
                 blacklist = True
             else:
@@ -2543,7 +2550,8 @@ class LNWallet(Logger):
         (if so, the next route will work with the policy we have now, no need to avoid the channel)
         """
         edge = route[sender_idx + 1]
-        policy = self.channel_db.get_policy_for_node(edge.short_channel_id, route[sender_idx].node_id)
+        policy = self.channel_db.get_policy_for_node(
+            edge.onion_short_channel_id or edge.short_channel_id, route[sender_idx].node_id)
         if policy is None:
             return False
         update_params = payload['fee_base_msat'], payload['fee_proportional_millionths'], payload['cltv_expiry_delta']
@@ -2894,6 +2902,7 @@ class LNWallet(Logger):
         # Note: if some route hints are multiple edges long, and these paths cross each other,
         #       we allow our path finding to cross the paths; i.e. the route hints are not isolated.
         private_route_edges = {}  # type: Dict[ShortChannelID, RouteEdge]
+        hint_edges = []  # type: List[RouteEdge]
         for private_path in r_tags:
             # we need to shift the node pubkey by one towards the destination:
             private_path_nodes = [edge[0] for edge in private_path][1:] + [invoice_pubkey]
@@ -2930,8 +2939,28 @@ class LNWallet(Logger):
                         fee_proportional_millionths=fee_proportional_millionths,
                         cltv_delta=cltv_delta,
                         node_features=node_info.features if node_info else 0)
-                private_route_edges[route_edge.short_channel_id] = route_edge
+                hint_edges.append(route_edge)
                 start_node = end_node
+        # Hints from different nodes may use the same scid alias. Those are different channels: give each
+        # of them a local short_channel_id, which only depends on the alias and the nodes, so that their
+        # blacklist entries and liquidity hints stay with them, whatever the (shuffled) order of the hints.
+        pairs_for_scid = defaultdict(set)
+        for route_edge in hint_edges:
+            pairs_for_scid[route_edge.short_channel_id].add((route_edge.start_node, route_edge.end_node))
+        taken = set(pairs_for_scid)
+        local_scids = {}
+        for route_edge in hint_edges:
+            scid = route_edge.short_channel_id
+            # an edge from us keeps its scid: the first channel of a route has to be one of ours
+            if len(pairs_for_scid[scid]) > 1 and route_edge.start_node != self.node_keypair.pubkey:
+                key = (scid, route_edge.start_node, route_edge.end_node)
+                if key not in local_scids:
+                    local_scids[key] = local_scid_for_route_hint(
+                        scid, route_edge.start_node, route_edge.end_node, taken=taken)
+                    taken.add(local_scids[key])
+                route_edge = dataclasses.replace(
+                    route_edge, short_channel_id=local_scids[key], onion_short_channel_id=scid)
+            private_route_edges[route_edge.short_channel_id] = route_edge
         # now find a route, end to end: between us and the recipient
         find_route = partial(
             self.network.path_finder.find_route,
@@ -4670,7 +4699,7 @@ class LNWallet(Logger):
             payment_secret=payment_secret)
         self.logger.info(f"pay len(route)={len(route)}. for payment_hash={payment_hash.hex()}")
         for i in range(len(route)):
-            self.logger.info(f"  {i}: edge={route[i].short_channel_id} hop_data={hops_data[i]!r}")
+            self.logger.info(f"  {i}: edge={route[i].onion_short_channel_id or route[i].short_channel_id} hop_data={hops_data[i]!r}")
         assert final_cltv_abs <= cltv_abs, (final_cltv_abs, cltv_abs)
         session_key = crandom.get_rand_bytes(32)  # session_key
         # if we are forwarding a trampoline payment, add trampoline onion

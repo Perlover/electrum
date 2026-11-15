@@ -82,7 +82,8 @@ def _collect_routing_log(
         'rejecting route', 'payment failure', 'Giving up', 'gossip_db status', 'suggest_split',
         'requesting channel graph', 'Received ', 'Deleting ', 'ignoring its channel range',
         'sent htlc', 'htlc failed', 'htlc succeeded', 'found a path', 'applied channel update',
-        'path finding with the penalties', 'no path found within the fee budget', 'within the budget.')))
+        'path finding with the penalties', 'no path found within the fee budget', 'within the budget.',
+        'is likely offline')))
     files = sorted(glob.glob(os.path.join(log_dir, '*.log*')), key=os.path.getmtime, reverse=True)[:max_files]
     lines = []  # oldest first
     for fn in reversed(files):

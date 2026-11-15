@@ -630,6 +630,14 @@ Pane {
                             dialog.open()
                         }
                     }
+
+                    Button {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        visible: AppController.isAndroid()
+                        text: 'Save and share routing log file (test build)'
+                        onClicked: AppController.shareDebugRoutingLog()
+                    }
                 }
             }
         }

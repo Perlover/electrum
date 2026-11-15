@@ -86,7 +86,8 @@ def _collect_routing_log(
         'is likely offline',
         'on gossip', 'gossip backlog', 'lost all gossip peers', 'query_short_channel_ids timed out',
         'woken up in the background', 'node announcements with an invalid signature', 'no gossip from our peers',
-        'does not respond. disconnecting', 'gossip sync tick failed')))
+        'does not respond. disconnecting', 'gossip sync tick failed',
+        'liquidity hints')))
     files = sorted(glob.glob(os.path.join(log_dir, '*.log*')), key=os.path.getmtime, reverse=True)[:max_files]
     lines = []  # oldest first
     for fn in reversed(files):

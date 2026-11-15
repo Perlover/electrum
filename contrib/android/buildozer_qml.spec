@@ -104,7 +104,7 @@ fullscreen = False
 # (list) Permissions
 # note: ACCESS_NETWORK_STATE and RECEIVE_BOOT_COMPLETED are for the job that updates the lightning
 #       gossip in the background: it waits for an unmetered network, and stays scheduled after a reboot.
-android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE, POST_NOTIFICATIONS, USE_BIOMETRIC, ACCESS_NETWORK_STATE, RECEIVE_BOOT_COMPLETED
+android.permissions = INTERNET, CAMERA, WRITE_EXTERNAL_STORAGE, POST_NOTIFICATIONS, USE_BIOMETRIC, ACCESS_NETWORK_STATE, RECEIVE_BOOT_COMPLETED, REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
 
 # (int) Android API to use  (compileSdkVersion)
 # note: when changing, Dockerfile also needs to be changed to install corresponding build tools

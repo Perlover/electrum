@@ -757,6 +757,24 @@ Note: if you open multiple lightning wallets, they will all try to bind the same
 
 Downloading the network gossip uses quite some bandwidth and storage, and is not recommended on mobile devices. If you use trampoline, you can only open channels with trampoline nodes."""),
     )
+    LIGHTNING_GOSSIP_BACKGROUND_SYNC = ConfigVar(
+        'lightning_gossip_background_sync', default=True, type_=bool,
+        short_desc=lambda: _("Update the network graph in the background"),
+        long_desc=lambda: _("""If you do not use trampoline routing, payments are routed using the graph of the Lightning Network that is stored on this device. While the app is not in use, the graph gets outdated, and payments made right after opening the app take longer or fail.
+
+With this option, the app updates the graph every few hours while it is not in use. This uses some data and battery."""),
+    )
+    LIGHTNING_GOSSIP_BACKGROUND_SYNC_INTERVAL = ConfigVar(
+        'lightning_gossip_background_sync_interval', default=120, type_=int,  # minutes
+    )
+    LIGHTNING_GOSSIP_BACKGROUND_SYNC_UNMETERED_ONLY = ConfigVar(
+        'lightning_gossip_background_sync_unmetered_only', default=True, type_=bool,
+        short_desc=lambda: _("Only on unmetered networks (Wi-Fi)"),
+    )
+    LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY = ConfigVar(
+        'lightning_gossip_background_sync_charging_only', default=False, type_=bool,
+        short_desc=lambda: _("Only while charging"),
+    )
     LIGHTNING_USE_RECOVERABLE_CHANNELS = ConfigVar(
         'use_recoverable_channels', default=True, type_=bool,
         short_desc=lambda: _("Create recoverable channels"),

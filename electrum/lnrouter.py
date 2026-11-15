@@ -23,6 +23,8 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
+import json
 import queue
 from collections import defaultdict
 from typing import Sequence, Tuple, Optional, Dict, TYPE_CHECKING, Set, Callable, NamedTuple, Container
@@ -52,6 +54,13 @@ MAX_PENALTY_BASE_MSAT = 5000
 PENALTY_BASE_MILLIONTHS = 1000
 DEFAULT_PENALTY_PROPORTIONAL_MILLIONTH = 100  # how much relative fee we apply for unknown sending capability of a channel
 HINT_DURATION = 3600  # how long (in seconds) a liquidity hint remains valid
+# After that, we no longer rely on it, but we remember for much longer that a channel could not forward an
+# amount: channels are often depleted in one direction for days. It might have got liquidity since then, so
+# it is not excluded, but it gets a penalty, to be tried after the channels we know nothing bad about.
+# The penalty fades out until the failure is forgotten.
+FAILURE_MEMORY_DURATION = 7 * 24 * 3600
+OLD_FAILURE_PENALTY_FACTOR = 10
+MAX_HINT_AMOUNT_MSAT = 21_000_000 * 10**11  # no amount can be more than all the bitcoins
 # a parallel channel of a node pair that failed to forward an amount gets this many times the default penalty
 PAIR_FAILURE_PENALTY_FACTOR = 10
 # outdated policies kept per node pair, see LiquidityHintMgr.update_outdated_policy
@@ -252,6 +261,18 @@ class LiquidAmount(NamedTuple):
     def is_invalid(self) -> bool:
         return now() - self.timestamp > HINT_DURATION
 
+    def is_forgotten(self) -> bool:
+        """for an amount that could not be sent: whether that is too long ago to matter"""
+        return now() - self.timestamp > FAILURE_MEMORY_DURATION
+
+    def old_failure_weight(self) -> float:
+        """for an amount that could not be sent, and a hint that is no longer valid:
+        how much of the penalty for an old failure applies. from 1, right after the hint expired, down to 0."""
+        age = now() - self.timestamp
+        if age >= FAILURE_MEMORY_DURATION:
+            return 0
+        return min(1, (FAILURE_MEMORY_DURATION - age) / (FAILURE_MEMORY_DURATION - HINT_DURATION))
+
 
 class LiquidityHint:
     """Encodes the amounts that can and cannot be sent over the direction of a
@@ -266,8 +287,31 @@ class LiquidityHint:
         self._cannot_send_forward = None  # type: Optional[LiquidAmount]
         self._can_send_backward = None  # type: Optional[LiquidAmount]
         self._cannot_send_backward = None  # type: Optional[LiquidAmount]
+        # A newer failure, of a larger amount, replaces an expired one in the fields above. So as not to
+        # lose that a smaller amount failed too, the expired one is kept here, until it is forgotten.
+        self._old_cannot_send_forward = None  # type: Optional[LiquidAmount]
+        self._old_cannot_send_backward = None  # type: Optional[LiquidAmount]
         self._inflight_htlcs_forward = 0
         self._inflight_htlcs_backward = 0
+
+    @staticmethod
+    def _contradicts_failure(can_send_amount_msat: int, failed: LiquidAmount) -> bool:
+        """whether a failure is to be dropped, now that we recorded that this amount can be sent"""
+        if can_send_amount_msat > failed.amount_msat:
+            return True
+        # an old failure, that is only remembered, is over also when just the amount that failed can be sent
+        return can_send_amount_msat == failed.amount_msat and failed.is_invalid()
+
+    @staticmethod
+    def _older_failure_to_keep(
+            replaced: Optional[LiquidAmount], older: Optional[LiquidAmount], *, new_amount_msat: int,
+    ) -> Optional[LiquidAmount]:
+        """A failure of new_amount_msat replaces the failure replaced, older being the one kept besides it
+        so far. Returns the one to keep besides the new one: that of the smallest amount, if it tells more
+        than the new one."""
+        candidates = [failed for failed in (replaced, older)
+                      if failed is not None and failed.amount_msat < new_amount_msat and not failed.is_forgotten()]
+        return min(candidates, key=lambda failed: failed.amount_msat) if candidates else None
 
     @property
     def can_send_forward(self) -> Optional[int]:
@@ -283,8 +327,10 @@ class LiquidityHint:
             return
         self._can_send_forward = LiquidAmount.from_amount(amount_msat)
         # we make a sanity check that sendable amount is lower than not sendable amount
-        if self._cannot_send_forward and self._can_send_forward.amount_msat > self._cannot_send_forward.amount_msat:
+        if self._cannot_send_forward and self._contradicts_failure(amount_msat, self._cannot_send_forward):
             self._cannot_send_forward = None
+        if self._old_cannot_send_forward and self._contradicts_failure(amount_msat, self._old_cannot_send_forward):
+            self._old_cannot_send_forward = None
 
     @property
     def can_send_backward(self) -> Optional[int]:
@@ -297,8 +343,10 @@ class LiquidityHint:
         if known is not None and known > amount_msat:
             return
         self._can_send_backward = LiquidAmount.from_amount(amount_msat)
-        if self._cannot_send_backward and self._can_send_backward.amount_msat > self._cannot_send_backward.amount_msat:
+        if self._cannot_send_backward and self._contradicts_failure(amount_msat, self._cannot_send_backward):
             self._cannot_send_backward = None
+        if self._old_cannot_send_backward and self._contradicts_failure(amount_msat, self._old_cannot_send_backward):
+            self._old_cannot_send_backward = None
 
     @property
     def cannot_send_forward(self) -> Optional[int]:
@@ -312,6 +360,8 @@ class LiquidityHint:
         known = self.cannot_send_forward
         if known is not None and known < amount_msat:
             return
+        self._old_cannot_send_forward = self._older_failure_to_keep(
+            self._cannot_send_forward, self._old_cannot_send_forward, new_amount_msat=amount_msat)
         self._cannot_send_forward = LiquidAmount.from_amount(amount_msat)
         if self._can_send_forward and self._can_send_forward.amount_msat > self._cannot_send_forward.amount_msat:
             self._can_send_forward = None
@@ -329,6 +379,8 @@ class LiquidityHint:
         known = self.cannot_send_backward
         if known is not None and known < amount_msat:
             return
+        self._old_cannot_send_backward = self._older_failure_to_keep(
+            self._cannot_send_backward, self._old_cannot_send_backward, new_amount_msat=amount_msat)
         self._cannot_send_backward = LiquidAmount.from_amount(amount_msat)
         if self._can_send_backward and self._can_send_backward.amount_msat > self._cannot_send_backward.amount_msat:
             self._can_send_backward = None
@@ -381,6 +433,8 @@ class LiquidityHint:
     def reset_amounts(self) -> None:
         self._cannot_send_backward = None
         self._cannot_send_forward = None
+        self._old_cannot_send_backward = None
+        self._old_cannot_send_forward = None
         self._can_send_forward = None
         self._can_send_backward = None
 
@@ -397,6 +451,13 @@ class LiquidityHintMgr:
     algorithm that favors channels which can route payments and penalizes
     channels that cannot.
     """
+    STATE_VERSION = 1  # of what export_state() returns
+    # the amounts of a LiquidityHint that are part of it, in this order, and whether each is a failure
+    _SAVED_AMOUNTS = (
+        ('_can_send_forward', False), ('_cannot_send_forward', True),
+        ('_can_send_backward', False), ('_cannot_send_backward', True),
+        ('_old_cannot_send_forward', True), ('_old_cannot_send_backward', True))
+
     def __init__(self):
         self.lock = RLock()
         self._liquidity_hints: Dict[ShortChannelID, LiquidityHint] = {}
@@ -558,6 +619,22 @@ class LiquidityHintMgr:
             when, outdated_policies = pair_outdated
             pair_failed = not when.is_invalid() and any(
                 is_policy_not_more_expensive(policy, outdated, amount_msat=amount_msat) for outdated in outdated_policies)
+        # A failure we no longer rely on: of the channel itself, or of the node pair.
+        old_failure_weight = 0
+        if hint is not None:
+            if node_from < node_to:
+                failed, older = hint._cannot_send_forward, hint._old_cannot_send_forward
+            else:
+                failed, older = hint._cannot_send_backward, hint._old_cannot_send_backward
+            if cannot_send is None and failed is not None and amount_msat >= failed.amount_msat:
+                old_failure_weight = failed.old_failure_weight()
+            if older is not None and amount_msat >= older.amount_msat:
+                old_failure_weight = max(old_failure_weight, older.old_failure_weight())
+        if pair_cannot_send is not None and policy is not None and not pair_failed and old_failure_weight < 1:
+            failed_amount, failed_policy = pair_cannot_send
+            if (amount_msat >= failed_amount.amount_msat and failed_amount.is_invalid()
+                    and is_policy_not_more_expensive(policy, failed_policy, amount_msat=amount_msat)):
+                old_failure_weight = max(old_failure_weight, failed_amount.old_failure_weight())
         node_failed = False
         newest_ts, node_failures = self._node_cannot_receive.get(node_to, _NO_NODE_FAILURES)
         if len(node_failures) >= NODE_FAILURE_MIN_SENDERS and now() - newest_ts <= HINT_DURATION:
@@ -582,8 +659,114 @@ class LiquidityHintMgr:
             likely_cannotsend_factor += PAIR_FAILURE_PENALTY_FACTOR
         if node_failed:
             likely_cannotsend_factor += NODE_FAILURE_PENALTY_FACTOR
+        likely_cannotsend_factor += OLD_FAILURE_PENALTY_FACTOR * old_failure_weight
         success_fee = fee_for_edge_msat(amount_msat, penalty_base_msat(amount_msat), DEFAULT_PENALTY_PROPORTIONAL_MILLIONTH)
         return success_fee * (1 + num_inflight_htlcs + likely_cannotsend_factor)
+
+    @with_lock
+    def export_state(self) -> dict:
+        """What we know about the liquidity of the channels, in a form that can be saved as json,
+        for import_state() of a later session. The htlcs in flight and the outdated policies
+        are not part of it: these are over, or fixed by the gossip, by then."""
+        def amount(la: Optional[LiquidAmount], *, is_failure: bool = False) -> Optional[list]:
+            if la is None or (la.is_forgotten() if is_failure else la.is_invalid()):
+                return None
+            return [la.amount_msat, la.timestamp]
+        # the failures of node pairs that are forgotten get dropped here
+        self._pair_cannot_send = {
+            pair: failed for pair, failed in self._pair_cannot_send.items() if not failed[0].is_forgotten()}
+        channels = {}
+        for scid, hint in self._liquidity_hints.items():
+            amounts = [amount(getattr(hint, name), is_failure=is_failure) for name, is_failure in self._SAVED_AMOUNTS]
+            if any(amounts):
+                channels[scid.hex()] = amounts
+        pairs = [
+            [node_from.hex(), node_to.hex(), failed.amount_msat, failed.timestamp, list(policy)]
+            for (node_from, node_to), (failed, policy) in self._pair_cannot_send.items()]
+        nodes = {}
+        for node_to, (_, node_failures) in self._node_cannot_receive.items():
+            failures = {n.hex(): amount(failed) for n, failed in node_failures.items() if not failed.is_invalid()}
+            if failures:
+                nodes[node_to.hex()] = failures
+        return {'version': self.STATE_VERSION, 'channels': channels, 'pairs': pairs, 'nodes': nodes}
+
+    @with_lock
+    def import_state(self, state: dict) -> int:
+        """Takes over what export_state() of an earlier session returned, and returns for how many channels,
+        node pairs and nodes. What expired is left out. What we learned ourselves takes precedence: if there
+        is any, only the hints of the channels we know nothing about are taken over, as the hints of
+        node pairs and nodes get dropped by later successes, and we cannot tell if these were such.
+        Raises if state does not have the form of what export_state() returns, or has amounts or policies
+        out of range: nothing is taken over then."""
+        if state['version'] != self.STATE_VERSION:
+            raise ValueError(f"unknown version {state['version']!r}")
+        time_now = now()
+
+        def amount(value, *, is_failure: bool = False) -> Optional[LiquidAmount]:
+            if value is None:
+                return None
+            amount_msat, timestamp = value
+            if (type(amount_msat) is not int or type(timestamp) is not int
+                    or not 0 <= amount_msat <= MAX_HINT_AMOUNT_MSAT or timestamp < 0):
+                raise ValueError(f"not an amount: {value!r}")
+            if timestamp > time_now:
+                # Our clock was set back since then, so we cannot tell how old the hint is, and do not rely
+                # on it: a success is dropped, a failure is taken as one that has just expired.
+                if not is_failure:
+                    return None
+                timestamp = time_now - HINT_DURATION - 1
+            la = LiquidAmount(amount_msat=amount_msat, timestamp=timestamp)
+            return None if (la.is_forgotten() if is_failure else la.is_invalid()) else la
+
+        def node_id(value) -> bytes:
+            node = bytes.fromhex(value)
+            if len(node) != 33:
+                raise ValueError(f"not a node id: {value!r}")
+            return node
+
+        # validate all of it first
+        channels = {}
+        for scid_hex, amounts in state['channels'].items():
+            scid = bytes.fromhex(scid_hex)
+            if len(scid) != 8 or len(amounts) != len(self._SAVED_AMOUNTS):
+                raise ValueError(f"not the hints of a channel: {scid_hex!r}: {amounts!r}")
+            channels[ShortChannelID(scid)] = [
+                amount(value, is_failure=is_failure) for value, (_, is_failure) in zip(amounts, self._SAVED_AMOUNTS)]
+        pairs = {}
+        for node_from, node_to, amount_msat, timestamp, policy in state['pairs']:
+            policy = tuple(policy)
+            if len(policy) != 3 or any(type(p) is not int or not 0 <= p < 2**32 for p in policy):
+                raise ValueError(f"not a policy: {policy!r}")
+            pairs[(node_id(node_from), node_id(node_to))] = (amount([amount_msat, timestamp], is_failure=True), policy)
+        nodes = {}
+        for node_to, failures in state['nodes'].items():
+            nodes[node_id(node_to)] = {node_id(n): amount(failed) for n, failed in failures.items()}
+
+        def has_amounts(hint: LiquidityHint) -> bool:
+            return any(getattr(hint, name) for name, _ in self._SAVED_AMOUNTS)
+
+        if (self._pair_cannot_send or self._node_cannot_receive
+                or any(has_amounts(hint) for hint in self._liquidity_hints.values())):
+            pairs, nodes = {}, {}
+        num_imported = 0
+        for scid, amounts in channels.items():
+            hint = self._liquidity_hints.get(scid)
+            if (hint is not None and has_amounts(hint)) or not any(amounts):
+                continue  # we know better by now, or it all expired
+            hint = self.get_hint(scid)
+            for (name, _), la in zip(self._SAVED_AMOUNTS, amounts):
+                setattr(hint, name, la)
+            num_imported += 1
+        for pair, (failed, policy) in pairs.items():
+            if failed is not None:
+                self._pair_cannot_send[pair] = (failed, policy)
+                num_imported += 1
+        for node_to, failures in nodes.items():
+            failures = {n: failed for n, failed in failures.items() if failed is not None}
+            if failures:
+                self._set_node_failures(node_to, failures)
+                num_imported += 1
+        return num_imported
 
     @with_lock
     def reset_liquidity_hints(self):
@@ -620,6 +803,44 @@ class LNPathFinder(Logger):
         # not changed, as path finding reads them without the lock.
         self._unknown_next_peer_reports = dict()  # type: Dict[bytes, Dict[bytes, int]]
         self._blacklist_lock = threading.Lock()
+        # The liquidity hints are kept in the db, for the next session: on mobile, the OS kills us soon after
+        # the user leaves, and a payment made minutes later would run into the same depleted channels again.
+        self._saved_liquidity_hints_loaded = False
+        self._saved_liquidity_hints_lock = threading.Lock()
+
+    def _load_saved_liquidity_hints(self) -> None:
+        """Takes over the liquidity hints an earlier session saved, once the db has them loaded."""
+        if self._saved_liquidity_hints_loaded or not self.channel_db.data_loaded.is_set():
+            return
+        # Whoever else comes here meanwhile waits until they are taken over: a save before that
+        # would overwrite them, with hints that lack them.
+        with self._saved_liquidity_hints_lock:
+            if self._saved_liquidity_hints_loaded:
+                return
+            try:
+                data = self.channel_db.liquidity_hints_at_load
+                if data:
+                    num_imported = self.liquidity_hints.import_state(json.loads(data))
+                    self.logger.info(f"loaded {num_imported} liquidity hints of earlier sessions")
+            except Exception as e:
+                self.logger.warning(f"could not load the liquidity hints of earlier sessions: {e!r}")
+            finally:
+                self._saved_liquidity_hints_loaded = True
+
+    def save_liquidity_hints(self) -> Optional[asyncio.Future]:
+        """Keeps the liquidity hints for the next session. Returns what to await to know they are on disk."""
+        self._load_saved_liquidity_hints()
+        if not self._saved_liquidity_hints_loaded:
+            return None  # not to overwrite those of earlier sessions, which the db has not loaded yet
+        data = json.dumps(self.liquidity_hints.export_state(), separators=(',', ':'))
+        return self.channel_db.save_liquidity_hints(data)
+
+    def reset_liquidity_hints(self) -> Optional[asyncio.Future]:
+        """Forgets the liquidity hints, also those of earlier sessions."""
+        with self._saved_liquidity_hints_lock:
+            self._saved_liquidity_hints_loaded = True
+        self.liquidity_hints.reset_liquidity_hints()
+        return self.save_liquidity_hints()
 
     def _is_edge_blacklisted(self, short_channel_id: ShortChannelID, *, now: int) -> bool:
         blacklist_expiration = self._edge_blacklist.get(short_channel_id)
@@ -690,6 +911,7 @@ class LNPathFinder(Logger):
         note: actual routable amounts are slightly different than reported here
               as fees would need to be added.
         """
+        self._load_saved_liquidity_hints()
         # the nodes that forwarded the htlc, or returned the error, are online
         online = []
         for r in route:
@@ -711,6 +933,7 @@ class LNPathFinder(Logger):
                 break
         else:
             assert failing_channel is None
+        self.save_liquidity_hints()
 
     def update_num_inflight_htlcs(self, route: LNPaymentRoute, *, add_htlcs: bool) -> None:
         self.logger.info(f"{'Adding' if add_htlcs else 'Removing'} inflight htlcs to graph (liquidity hints).")
@@ -952,6 +1175,7 @@ class LNPathFinder(Logger):
         assert type(invoice_amount_msat) is int or invoice_amount_msat is None
         if my_sending_channels is None:
             my_sending_channels = {}
+        self._load_saved_liquidity_hints()
 
         previous_hops = self.get_shortest_path_hops(
             nodeA=nodeA,

@@ -32,6 +32,7 @@ from typing import Sequence, List, Tuple, Optional, Dict, NamedTuple, TYPE_CHECK
 import binascii
 import base64
 import asyncio
+import sqlite3
 import threading
 from enum import IntEnum
 import functools
@@ -351,6 +352,14 @@ PRIMARY KEY(short_channel_id)
 )"""
 
 
+# what the path finder learned from our payments, as json. key: what it is about
+create_path_finder_state = """
+CREATE TABLE IF NOT EXISTS path_finder_state (
+key TEXT NOT NULL,
+value TEXT NOT NULL,
+PRIMARY KEY(key)
+)"""
+
 # small integers that describe the state of the db itself
 create_meta = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -438,6 +447,8 @@ class ChannelDB(SqlDB):
         self.latest_policy_ts_at_load = None  # type: Optional[int]
         # until when a previous session had received all the gossip, if it recorded that
         self.synced_until_at_load = None  # type: Optional[int]
+        # what the path finder of a previous session knew about the liquidity of the channels, as json
+        self.liquidity_hints_at_load = None  # type: Optional[str]
         self.network = network # only for callback
 
     @classmethod
@@ -649,6 +660,7 @@ class ChannelDB(SqlDB):
         c.execute(create_channel_info)
         c.execute(create_orphaned_channel)
         c.execute(create_meta)
+        c.execute(create_path_finder_state)
         self.conn.commit()
 
     @sql
@@ -692,6 +704,23 @@ class ChannelDB(SqlDB):
     def save_synced_until(self, timestamp: int) -> asyncio.Future:
         """Records that we received all the gossip up to this time, see LNGossip."""
         return self._db_save_synced_until(int(timestamp))
+
+    @sql
+    def _db_save_liquidity_hints(self, data: str) -> bool:
+        try:
+            c = self.conn.cursor()
+            c.execute("REPLACE INTO path_finder_state (key, value) VALUES ('liquidity_hints', ?)", (data,))
+            # a mobile OS can kill us at any time, and a payment that follows should know what this one found out
+            self.conn.commit()
+        except sqlite3.Error as e:  # nobody waits for the result, and we can do without the hints
+            self.logger.warning(f"could not save the liquidity hints: {e!r}")
+            return False
+        return True
+
+    def save_liquidity_hints(self, data: str) -> asyncio.Future:
+        """Keeps what the path finder knows about the liquidity of the channels for the next session,
+        see LNPathFinder."""
+        return self._db_save_liquidity_hints(data)
 
     @sql
     def _db_save_node_info(self, node_id: bytes, msg: bytes):
@@ -1010,6 +1039,9 @@ class ChannelDB(SqlDB):
         c.execute("SELECT value FROM meta WHERE key='synced_until'")
         row = c.fetchone()
         self.synced_until_at_load = int(row[0]) if row else None
+        c.execute("SELECT value FROM path_finder_state WHERE key='liquidity_hints'")
+        row = c.fetchone()
+        self.liquidity_hints_at_load = row[0] if row else None
         (nchans_with_0p, nchans_with_1p, nchans_with_2p) = self.get_num_channels_partitioned_by_policy_count()
         self.logger.info(f'num_channels_partitioned_by_policy_count. '
                          f'0p: {nchans_with_0p}, 1p: {nchans_with_1p}, 2p: {nchans_with_2p}')

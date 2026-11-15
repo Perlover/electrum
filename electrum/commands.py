@@ -1956,7 +1956,7 @@ class Commands(Logger):
     @command('n')
     async def reset_liquidity_hints(self):
         if self.network.path_finder:
-            self.network.path_finder.liquidity_hints.reset_liquidity_hints()
+            self.network.path_finder.reset_liquidity_hints()
             self.network.path_finder.clear_blacklist()
 
     @command('wnpl')

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import random
 import sqlite3
 import time
@@ -31,6 +32,7 @@ from electrum.lnmsg import encode_msg
 from electrum.lnrouter import (PathEdge, LiquidityHintMgr, DEFAULT_PENALTY_PROPORTIONAL_MILLIONTH,
                                fee_for_edge_msat, LNPaymentTRoute, TrampolineEdge,
                                HINT_DURATION, PAIR_FAILURE_PENALTY_FACTOR, RouteEdge,
+                               FAILURE_MEMORY_DURATION, OLD_FAILURE_PENALTY_FACTOR,
                                NODE_FAILURE_MIN_SENDERS, NODE_FAILURE_PENALTY_FACTOR,
                                OFFLINE_NODE_DURATION, MAX_OUTDATED_POLICIES_PER_PAIR)
 
@@ -2682,9 +2684,15 @@ class Test_LNRouter(ElectrumTestCase):
         hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
         self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default(1_000_000),
                          hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
-        later = int(time.time()) + HINT_DURATION + 1
+        later = int(time.time()) + FAILURE_MEMORY_DURATION + 1
         with mock.patch('electrum.lnrouter.now', return_value=later):
             self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+        later = int(time.time()) + HINT_DURATION + 1
+        with mock.patch('electrum.lnrouter.now', return_value=later):
+            # an expired failure is remembered for some time, see the tests of old failures
+            self.assertLess(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+            self.assertGreater((1 + PAIR_FAILURE_PENALTY_FACTOR) * default(1_000_000),
+                               hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
             # an expired failure is replaced by a newer one, even of a larger amount
             hints.update_cannot_send(a, b, channel(1), amount_msat=2_000_000, policy=policy)
             self.assertEqual(default(1_500_000), hints.penalty(a, b, channel(2), amount_msat=1_500_000, policy=policy))
@@ -2712,6 +2720,600 @@ class Test_LNRouter(ElectrumTestCase):
             liquidity_hints.update_can_send(node_from, node_to, channel_id, amount_msat=5_000)
             hint = liquidity_hints.get_hint(channel_id)
             self.assertEqual(5_000, hint.can_send(node_from < node_to))
+
+    @staticmethod
+    def _old_failure_penalty(default_penalty: float, age: int) -> float:
+        weight = (FAILURE_MEMORY_DURATION - age) / (FAILURE_MEMORY_DURATION - HINT_DURATION)
+        return default_penalty * (1 + OLD_FAILURE_PENALTY_FACTOR * weight)
+
+    def test_old_failure_of_a_channel_is_a_penalty_that_fades_out(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=amount_msat)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000)
+            mock_time = start + HINT_DURATION
+            self.assertEqual(inf, hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            # then the channel is not excluded any more, but is to be tried after others
+            mock_time = start + HINT_DURATION + 1
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), HINT_DURATION + 1),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=0.001)
+            self.assertLess(10 * default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            self.assertAlmostEqual(self._old_failure_penalty(default(3_000_000), HINT_DURATION + 1),
+                                   hints.penalty(a, b, channel(1), amount_msat=3_000_000), delta=0.001)
+            # smaller amounts, the other direction and other channels are not affected
+            self.assertEqual(default(999_999), hints.penalty(a, b, channel(1), amount_msat=999_999))
+            self.assertEqual(default(1_000_000), hints.penalty(b, a, channel(1), amount_msat=1_000_000))
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000))
+            # the penalty fades out
+            halfway = (HINT_DURATION + FAILURE_MEMORY_DURATION) // 2
+            mock_time = start + halfway
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), halfway),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=0.001)
+            self.assertAlmostEqual((1 + OLD_FAILURE_PENALTY_FACTOR / 2) * default(1_000_000),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=1)
+            mock_time = start + FAILURE_MEMORY_DURATION - 1
+            self.assertLess(default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            self.assertGreater(1.01 * default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            # until the failure is forgotten
+            mock_time = start + FAILURE_MEMORY_DURATION
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+
+    def test_how_long_and_how_much_an_old_failure_counts(self):
+        # the tests of old failures compute what they expect from these
+        self.assertEqual(3600, HINT_DURATION)
+        self.assertEqual(7 * 24 * 3600, FAILURE_MEMORY_DURATION)
+        self.assertEqual(10, OLD_FAILURE_PENALTY_FACTOR)
+        self.assertEqual(1100 * (1 + 10 * 0.5), self._old_failure_penalty(1100, (3600 + 7 * 24 * 3600) // 2))
+
+    def test_failure_we_still_rely_on_is_not_over_when_just_that_amount_gets_through(self):
+        # as it was before old failures were remembered
+        a, b = node('a'), node('b')
+        for forward in (True, False):
+            node_from, node_to = (a, b) if forward else (b, a)
+            hints = LiquidityHintMgr()
+            hints.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+            hints.update_can_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+            self.assertEqual(inf, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=forward)
+            hints.update_can_send(node_from, node_to, channel(1), amount_msat=1_000_001)
+            self.assertEqual(0, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=forward)
+
+    def test_newer_failure_of_a_larger_amount_does_not_erase_an_old_one_of_a_smaller_amount(self):
+        a, b = node('a'), node('b')
+        self.assertLess(a, b)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=amount_msat)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            for forward in (True, False):
+                node_from, node_to = (a, b) if forward else (b, a)
+                def penalty(amount_msat, hints, node_from=node_from, node_to=node_to):
+                    return hints.penalty(node_from, node_to, channel(1), amount_msat=amount_msat)
+                original = LiquidityHintMgr()
+                mock_time = start
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=250_000)
+                age = 3 * HINT_DURATION
+                mock_time = start + age
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, original), delta=0.001)
+                restored = LiquidityHintMgr()
+                self.assertEqual(1, restored.import_state(json.loads(json.dumps(original.export_state()))))
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, restored), delta=0.001)
+                # e.g. the first attempt of the next payment, before it gets split
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+                self.assertEqual(inf, penalty(1_000_000, original))
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, original), delta=0.001)
+                self.assertEqual(default(249_999), penalty(249_999, original))
+                # the next session knows both too
+                restored = LiquidityHintMgr()
+                restored.import_state(json.loads(json.dumps(original.export_state())))
+                self.assertEqual(inf, penalty(1_000_000, restored))
+                self.assertAlmostEqual(
+                    self._old_failure_penalty(default(500_000), age), penalty(500_000, restored), delta=0.001)
+                self.assertEqual(default(249_999), penalty(249_999, restored))
+                # once the newer one is old too, it is the one that counts for the amounts it tells about
+                mock_time = start + age + 2 * HINT_DURATION
+                for hints in (original, restored):
+                    self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age + 2 * HINT_DURATION),
+                                           penalty(500_000, hints), delta=0.001)
+                    self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), 2 * HINT_DURATION),
+                                           penalty(1_000_000, hints), delta=0.001)
+                # a failure of an even larger amount: the one of the smallest amount is kept besides it
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=2_000_000)
+                self.assertEqual(inf, penalty(2_000_000, original))
+                self.assertAlmostEqual(self._old_failure_penalty(default(1_500_000), age + 2 * HINT_DURATION),
+                                       penalty(1_500_000, original), delta=0.001)
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age + 2 * HINT_DURATION),
+                                       penalty(500_000, original), delta=0.001)
+                # a forward of an amount in between ends the failure of the smaller amount only
+                original.update_can_send(node_from, node_to, channel(1), amount_msat=600_000)
+                self.assertEqual(0, penalty(500_000, original))
+                self.assertEqual(inf, penalty(2_000_000, original))
+                mock_time += HINT_DURATION + 1
+                self.assertEqual(default(500_000), penalty(500_000, original))
+                self.assertLess(default(2_000_000), penalty(2_000_000, original))
+                self.assertNotEqual(inf, penalty(2_000_000, original))
+                # a failure of a smaller amount replaces the old ones: it tells more
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=100_000)
+                hint = original.get_hint(channel(1))
+                self.assertIsNone(hint._old_cannot_send_forward)
+                self.assertIsNone(hint._old_cannot_send_backward)
+                self.assertEqual(inf, penalty(100_000, original))
+                # and what is forgotten is not kept besides a new failure
+                mock_time += FAILURE_MEMORY_DURATION + 1
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=3_000_000)
+                self.assertIsNone(hint._old_cannot_send_forward)
+                self.assertIsNone(hint._old_cannot_send_backward)
+                self.assertEqual(default(500_000), penalty(500_000, original))
+
+    def test_old_failure_of_a_channel_is_over_when_the_amount_gets_through(self):
+        a, b = node('a'), node('b')
+        default = LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=1_000_000)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            for node_from, node_to, sent_amount_msat, is_over in (
+                    (a, b, 999_999, False), (a, b, 1_000_000, True), (a, b, 2_000_000, True),
+                    (b, a, 999_999, False), (b, a, 1_000_000, True), (b, a, 2_000_000, True)):
+                msg = (node_from < node_to, sent_amount_msat)
+                hints = LiquidityHintMgr()
+                mock_time = start
+                hints.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+                mock_time = start + 2 * HINT_DURATION
+                self.assertLess(default, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=msg)
+                hints.update_can_send(node_from, node_to, channel(1), amount_msat=sent_amount_msat)
+                # once we do not rely on that success any more either
+                mock_time = start + 3 * HINT_DURATION + 1
+                penalty = hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000)
+                if is_over:
+                    self.assertEqual(default, penalty, msg=msg)
+                else:
+                    self.assertAlmostEqual(self._old_failure_penalty(default, 3 * HINT_DURATION + 1), penalty,
+                                           delta=0.001, msg=msg)
+
+    def test_old_failure_of_a_node_pair_is_a_penalty_for_its_parallel_channels(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        policy, more_expensive = (1000, 100, 40), (2000, 100, 40)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=amount_msat, policy=policy)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+            age = 5 * HINT_DURATION
+            mock_time = start + age
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), age),
+                                   hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # as with a failure we still rely on: not for smaller amounts, more expensive channels, the way back
+            self.assertEqual(default(999_999), hints.penalty(a, b, channel(2), amount_msat=999_999, policy=policy))
+            self.assertEqual(default(1_000_000),
+                             hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=more_expensive))
+            self.assertEqual(default(1_000_000), hints.penalty(b, a, channel(2), amount_msat=1_000_000, policy=policy))
+            # the channel that failed does not get it twice
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), age),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # a forward over a parallel channel that is not more expensive ends it
+            hints.update_can_send(a, b, channel(3), amount_msat=1_000_000, policy=policy)
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+
+    async def test_find_path_tries_a_channel_with_an_old_failure_after_others_but_does_not_exclude_it(self):
+        s, a, b, d = node('s'), node('a'), node('b'), node('d')
+        free, one_sat = (0, 0, 40), (1000, 0, 40)
+        amount_msat = 1_000_000
+        def find():
+            path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+            return path and [edge.end_node for edge in path]
+        start = mock_time = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            self._make_graph([(41, s, a, free, free), (42, a, d, free, free),
+                              (43, s, b, free, free), (44, b, d, one_sat, free)])
+            self.assertEqual([a, d], find())
+            # no policy: so that it is the failure of the channel that counts, not that of the node pair
+            self.path_finder.liquidity_hints.update_cannot_send(a, d, channel(42), amount_msat=amount_msat)
+            self.assertEqual([b, d], find())
+            mock_time = start + 3 * HINT_DURATION
+            self.assertEqual([b, d], find())  # without the memory of the failure, the path through a again
+            mock_time = start + FAILURE_MEMORY_DURATION
+            self.assertEqual([a, d], find())
+            # it is the only path
+            self.cdb.stop()
+            await self.cdb.stopped_event.wait()
+            self._make_graph([(41, s, a, free, free), (42, a, d, free, free)])
+            mock_time = start
+            self.path_finder.liquidity_hints.update_cannot_send(a, d, channel(42), amount_msat=amount_msat)
+            self.assertIsNone(find())
+            mock_time = start + HINT_DURATION + 1
+            self.assertEqual([a, d], find())
+
+    @staticmethod
+    def _record_liquidity(hints: LiquidityHintMgr) -> LiquidityHintMgr:
+        a, b, c, d, e = (node(x) for x in 'abcde')
+        policy = (1000, 100, 40)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        hints.update_can_send(a, b, channel(1), amount_msat=200_000, policy=policy)
+        hints.update_can_send(b, a, channel(2), amount_msat=300_000, policy=policy)
+        for number, sender in ((11, c), (12, d), (13, e)):  # b cannot receive
+            hints.update_cannot_send(sender, b, channel(number), amount_msat=500_000, policy=policy)
+        return hints
+
+    def _assert_same_liquidity(self, expected: LiquidityHintMgr, hints: LiquidityHintMgr):
+        a, b, c, x = node('a'), node('b'), node('c'), node('x')
+        policy = (1000, 100, 40)
+        penalties = []
+        for node_from, node_to, number in ((a, b, 1), (b, a, 1), (a, b, 2), (b, a, 2), (a, b, 3), (c, b, 11),
+                                           (b, c, 11), (c, b, 14), (x, b, 15), (x, a, 16)):
+            for amount_msat in (100_000, 200_000, 250_000, 300_000, 500_000, 900_000, 1_000_000, 2_000_000):
+                penalties.append(expected.penalty(node_from, node_to, channel(number), amount_msat=amount_msat, policy=policy))
+                self.assertEqual(
+                    penalties[-1],
+                    hints.penalty(node_from, node_to, channel(number), amount_msat=amount_msat, policy=policy),
+                    msg=(node_from, node_to, number, amount_msat))
+        self.assertGreater(len(set(penalties)), 10)  # the probes tell the hints apart
+
+    def test_liquidity_hints_are_exported_and_imported(self):
+        hints = self._record_liquidity(LiquidityHintMgr())
+        hints.add_htlc(node('a'), node('b'), channel(1))
+        hints.update_outdated_policy(node('a'), node('b'), policy=(1000, 100, 40))
+        state = json.loads(json.dumps(hints.export_state()))
+        restored = LiquidityHintMgr()
+        # 5 channels, 4 node pairs, 1 node that several nodes failed to forward to
+        self.assertEqual(10, restored.import_state(state))
+        # as before, but for the htlc in flight and the outdated policy
+        self._assert_same_liquidity(self._record_liquidity(LiquidityHintMgr()), restored)
+        # each kind of hint is there
+        a, b, x = node('a'), node('b'), node('x')
+        policy = (1000, 100, 40)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(x, b, channel(15), amount_msat=amount_msat, policy=policy)
+        self.assertEqual(inf, restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy))
+        self.assertEqual(0, restored.penalty(a, b, channel(1), amount_msat=200_000, policy=policy))
+        self.assertEqual(0, restored.penalty(b, a, channel(2), amount_msat=300_000, policy=policy))
+        self.assertEqual(default(250_000), restored.penalty(a, b, channel(1), amount_msat=250_000, policy=policy))
+        self.assertEqual((1 + NODE_FAILURE_PENALTY_FACTOR) * default(500_000),
+                         restored.penalty(x, b, channel(15), amount_msat=500_000, policy=policy))
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR + NODE_FAILURE_PENALTY_FACTOR) * default(1_000_000),
+                         restored.penalty(a, b, channel(3), amount_msat=1_000_000, policy=policy))
+        self.assertEqual(state, json.loads(json.dumps(restored.export_state())))
+        self.assertEqual(0, restored.import_state(state))  # nothing new
+
+    def test_imported_liquidity_hints_keep_their_age(self):
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        default = LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        empty = {'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}}
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints = LiquidityHintMgr()
+            self.assertEqual(empty, hints.export_state())
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+            hints.update_can_send(a, b, channel(2), amount_msat=400_000)
+            state = hints.export_state()
+            # later within the hour: hints we still rely on
+            mock_time = start + HINT_DURATION - 60
+            restored = LiquidityHintMgr()
+            self.assertEqual(4, restored.import_state(state))  # 2 channels, the node pair, the node
+            self.assertEqual(inf, restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy))
+            self.assertEqual(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+            mock_time = start + HINT_DURATION + 1  # they expire when those of the earlier session would
+            self.assertAlmostEqual(self._old_failure_penalty(default, HINT_DURATION + 1),
+                                   restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy), delta=0.001)
+            self.assertLess(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+            # hours later: only the failures are kept, as old ones
+            age = 6 * HINT_DURATION
+            mock_time = start + age
+            state_later = hints.export_state()
+            self.assertEqual([channel(1).hex()], list(state_later['channels']))
+            self.assertEqual(1, len(state_later['pairs']))
+            self.assertEqual({}, state_later['nodes'])
+            for exported in (state, state_later):
+                restored = LiquidityHintMgr()
+                self.assertEqual(2, restored.import_state(json.loads(json.dumps(exported))))  # the channel, the pair
+                for number in (1, 3):  # the channel, a parallel one
+                    self.assertAlmostEqual(
+                        self._old_failure_penalty(default, age),
+                        restored.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # forgotten
+            mock_time = start + FAILURE_MEMORY_DURATION + 1
+            self.assertEqual(empty, hints.export_state())
+            restored = LiquidityHintMgr()
+            self.assertEqual(0, restored.import_state(state))
+            self.assertEqual(empty, restored.export_state())
+            # The clock was set back since the hints got saved: we cannot tell their age, so we do not rely
+            # on them. The failures, of the channel and of the pair, are taken as ones that have just expired.
+            for clock_set_back_by in (1, 10 * FAILURE_MEMORY_DURATION):
+                mock_time = start - clock_set_back_by
+                restored = LiquidityHintMgr()
+                self.assertEqual(2, restored.import_state(state), msg=clock_set_back_by)
+                for number in (1, 3):
+                    self.assertAlmostEqual(
+                        self._old_failure_penalty(default, HINT_DURATION + 1),
+                        restored.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+                self.assertLess(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+                self.assertEqual({}, restored._node_cannot_receive)
+
+    def test_liquidity_hints_we_have_take_precedence_over_imported_ones(self):
+        a, b, c = node('a'), node('b'), node('c')
+        policy = (1000, 100, 40)
+        earlier = LiquidityHintMgr()
+        earlier.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        earlier.update_cannot_send(a, c, channel(5), amount_msat=1_000_000, policy=policy)
+        state = earlier.export_state()
+        hints = LiquidityHintMgr()
+        hints.update_can_send(a, b, channel(1), amount_msat=3_000_000, policy=policy)
+        hints.update_cannot_send(c, b, channel(7), amount_msat=2_000_000, policy=policy)
+        # only the channel to c: we know better what a can send to b, and the failure of the pair a -> b
+        # is older than our forward, which would have dropped it
+        self.assertEqual(1, hints.import_state(state))
+        self.assertEqual(0, hints.penalty(a, b, channel(1), amount_msat=3_000_000, policy=policy))
+        self.assertEqual(inf, hints.penalty(a, c, channel(5), amount_msat=1_000_000, policy=policy))
+        self.assertEqual({(c, b)}, set(hints._pair_cannot_send))
+        self.assertEqual({b}, set(hints._node_cannot_receive))
+        self.assertEqual({c}, set(hints._node_cannot_receive[b][1]))
+
+    def test_import_of_liquidity_hints_that_are_garbage_takes_over_nothing(self):
+        good = self._record_liquidity(LiquidityHintMgr()).export_state()
+        scid, pair, node_to = channel(1).hex(), good['pairs'][0], node('b').hex()
+        def changed(**kwargs):
+            return {**json.loads(json.dumps(good)), **kwargs}
+        def channel_with(value, *, index=1):
+            amounts = [None] * 6
+            amounts[index] = value
+            return changed(channels={scid: amounts})
+        # the control: this is fine. the channel, and the 4 node pairs and the node of the good ones
+        self.assertEqual(6, LiquidityHintMgr().import_state(channel_with([1000, int(time.time())])))
+        too_much = 21_000_000 * 10**11 + 1
+        for bad in (
+                None, [], {}, 'x', changed(version=2), changed(version='1'),
+                changed(channels=[]), changed(channels={scid: [None] * 5}), changed(channels={scid: [None] * 7}),
+                changed(channels={scid[:-2]: [None] * 6}), changed(channels={'zz': [None] * 6}),
+                channel_with([1, 2, 3]), channel_with([-1, 5]), channel_with(['1000', 5]), channel_with([1000, 5.5]),
+                channel_with([True, 5]), channel_with([1000, -5]), channel_with([too_much, 5]),
+                channel_with([10**400, 5]), channel_with([10**400, 10**18]), channel_with([1000.0, 5], index=0),
+                channel_with([too_much, 5], index=0), channel_with([too_much, 5], index=4),
+                channel_with([too_much, 5], index=5),
+                changed(pairs=[pair[:4]]), changed(pairs=[pair[:4] + [[1000, 100]]]),
+                changed(pairs=[pair[:4] + [[1000, 100, '40']]]), changed(pairs=[[pair[0][:-2]] + pair[1:]]),
+                changed(pairs={'a': 1}), changed(pairs=[pair[:2] + [None, 5] + pair[4:]]),
+                changed(pairs=[pair[:2] + [too_much, 5] + pair[4:]]), changed(pairs=[pair[:4] + [[2**32, 100, 40]]]),
+                changed(pairs=[pair[:4] + [[1000, -1, 40]]]), changed(pairs=[pair[:4] + [[1000, 100, 10**400]]]),
+                changed(nodes=[]), changed(nodes={node_to: []}), changed(nodes={node_to: {'00': [1000, 5]}}),
+                changed(nodes={node_to[:-2]: {}}), changed(nodes={node_to: {node_to: [1000]}}),
+                changed(nodes={node_to: {node_to: [too_much, 5]}}),
+        ):
+            hints = LiquidityHintMgr()
+            with self.assertRaises((TypeError, ValueError, KeyError, AttributeError), msg=bad):
+                hints.import_state(bad)
+            self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}}, hints.export_state(), msg=bad)
+        self.assertEqual(10, LiquidityHintMgr().import_state(changed()))
+        # the largest values that are taken do not make the penalty raise
+        hints = LiquidityHintMgr()
+        most = 21_000_000 * 10**11
+        self.assertEqual(2, hints.import_state(changed(
+            channels={scid: [None, [most, int(time.time())], None, None, [most, 5], None]},
+            pairs=[pair[:2] + [most, int(time.time())] + [[2**32 - 1, 2**32 - 1, 2**32 - 1]]], nodes={})))
+        for amount_msat in (1, most - 1, most, 10 * most):
+            for policy in ((0, 0, 0), (2**32 - 1, 2**32 - 1, 2**32 - 1)):
+                for number in (1, 2):
+                    self.assertLessEqual(0, hints.penalty(node('a'), node('b'), channel(number),
+                                                          amount_msat=amount_msat, policy=policy))
+
+    def _liquidity_route(self, number: int):
+        s, a, b = node('s'), node('a'), node('b')
+        return [RouteEdge(start_node=s, end_node=a, short_channel_id=channel(40), fee_base_msat=0,
+                          fee_proportional_millionths=0, cltv_delta=40, node_features=0),
+                RouteEdge(start_node=a, end_node=b, short_channel_id=channel(number), fee_base_msat=1000,
+                          fee_proportional_millionths=100, cltv_delta=40, node_features=0)]
+
+    def _new_session(self, *, load_data: bool = True):
+        """returns the channel db and the path finder of a new session, over the same files"""
+        class fake_network:
+            config = self.config
+            asyncio_loop = util.get_asyncio_loop()
+            trigger_callback = lambda *args: None
+            register_callback = lambda *args: None
+            interface = None
+        cdb = lnrouter.ChannelDB(fake_network())
+        return cdb, lnrouter.LNPathFinder(cdb), (cdb.load_data() if load_data else None)
+
+    async def _end_session(self, cdb):
+        cdb.stop()
+        await cdb.stopped_event.wait()
+
+    def _cannot_send(self, path_finder, number: int) -> bool:
+        return inf == path_finder.liquidity_hints.penalty(
+            node('a'), node('b'), channel(number), amount_msat=1_000_000, policy=(1000, 100, 40))
+
+    async def test_liquidity_hints_are_kept_for_the_next_session(self):
+        cdb, path_finder, loaded = self._new_session()
+        await loaded
+        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+        self.assertTrue(self._cannot_send(path_finder, 42))
+        await path_finder.save_liquidity_hints()
+        # they are on disk already, in case we get killed: another connection sees them
+        other = sqlite3.connect(cdb.path)
+        (saved,), = other.execute("SELECT value FROM path_finder_state WHERE key='liquidity_hints'").fetchall()
+        other.close()
+        self.assertEqual({channel(40).hex(), channel(42).hex()}, set(json.loads(saved)['channels']))
+        await self._end_session(cdb)
+
+        self.cdb, path_finder, loaded = self._new_session()
+        await loaded
+        self.assertFalse(self._cannot_send(path_finder, 42))
+        # they are taken over when the path finder gets used
+        self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
+        self.assertTrue(self._cannot_send(path_finder, 42))
+        self.assertEqual(0, path_finder.liquidity_hints.penalty(
+            node('s'), node('a'), channel(40), amount_msat=1_000_000, policy=(0, 0, 40)))
+
+    async def test_liquidity_hints_are_saved_after_each_htlc(self):
+        cdb, path_finder, loaded = self._new_session()
+        await loaded
+        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+        path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000)
+        await cdb.save_synced_until(1)  # what we asked the db for before this is done
+        await self._end_session(cdb)
+        self.cdb, path_finder, loaded = self._new_session()
+        await loaded
+        self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
+        self.assertEqual([True, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
+        # also that 43 forwarded the amount after 42 failed, which ended the failure of the node pair
+        self.assertEqual(0, path_finder.liquidity_hints.penalty(
+            node('a'), node('b'), channel(43), amount_msat=1_000_000, policy=(1000, 100, 40)))
+        self.assertEqual({}, path_finder.liquidity_hints._pair_cannot_send)
+
+    async def test_liquidity_hints_of_earlier_sessions_are_not_overwritten_before_the_db_is_loaded(self):
+        cdb, path_finder, loaded = self._new_session()
+        await loaded
+        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+        await path_finder.save_liquidity_hints()
+        await self._end_session(cdb)
+
+        cdb, path_finder, _ = self._new_session(load_data=False)
+        path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000, failing_channel=channel(43))
+        self.assertIsNone(path_finder.save_liquidity_hints())
+        self.assertEqual([False, True], [self._cannot_send(path_finder, number) for number in (42, 43)])
+        await cdb.load_data()
+        path_finder.update_liquidity_hints(self._liquidity_route(44), 1_000_000, failing_channel=channel(44))
+        self.assertEqual([True, True, True], [self._cannot_send(path_finder, number) for number in (42, 43, 44)])
+        await path_finder.save_liquidity_hints()
+        await self._end_session(cdb)
+
+        self.cdb, path_finder, loaded = self._new_session()
+        await loaded
+        path_finder.update_liquidity_hints(self._liquidity_route(45), 1_000_000)
+        self.assertEqual([True, True, True], [self._cannot_send(path_finder, number) for number in (42, 43, 44)])
+
+    async def test_old_failure_is_known_to_the_next_session(self):
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        default = LiquidityHintMgr().penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy)
+        start = mock_time = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            await path_finder.save_liquidity_hints()
+            await self._end_session(cdb)
+            # hours later, as the app that the OS killed gets opened for the next payment
+            age = 3 * HINT_DURATION
+            mock_time = start + age
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            hints = path_finder.liquidity_hints
+            self.assertEqual(default, hints.penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy))
+            self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=b, invoice_amount_msat=1_000_000))
+            for number in (42, 49):  # the channel that failed, a parallel one
+                self.assertAlmostEqual(
+                    self._old_failure_penalty(default, age),
+                    hints.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # this session saves it again, as old as it is
+            path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
+            await path_finder.save_liquidity_hints()
+            await self._end_session(cdb)
+            age = 5 * HINT_DURATION
+            mock_time = start + age
+            self.cdb, path_finder, loaded = self._new_session()
+            await loaded
+            self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=b, invoice_amount_msat=1_000_000))
+            self.assertAlmostEqual(
+                self._old_failure_penalty(default, age),
+                path_finder.liquidity_hints.penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy), delta=0.001)
+
+    async def test_liquidity_hints_of_earlier_sessions_are_taken_over_before_an_htlc_result_is_recorded(self):
+        cdb, path_finder, loaded = self._new_session()
+        await loaded
+        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+        await path_finder.save_liquidity_hints()
+        await self._end_session(cdb)
+        self.cdb, path_finder, loaded = self._new_session()
+        await loaded
+        # the first thing this session does with the path finder. the failures of node pairs are only
+        # taken over as long as we have not learned anything ourselves
+        seen = []
+        import_state = path_finder.liquidity_hints.import_state
+        def spy(state):
+            seen.append((path_finder._saved_liquidity_hints_loaded, path_finder._saved_liquidity_hints_lock.locked()))
+            return import_state(state)
+        path_finder.liquidity_hints.import_state = spy
+        path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
+        self.assertEqual({(node('a'), node('b'))}, set(path_finder.liquidity_hints._pair_cannot_send))
+        # nobody could save hints that lack those of earlier sessions while these were being taken over
+        self.assertEqual([(False, True)], seen)
+        self.assertTrue(path_finder._saved_liquidity_hints_loaded)
+
+    async def test_liquidity_hints_that_cannot_be_saved_do_not_break_anything(self):
+        self.cdb, path_finder, loaded = self._new_session()
+        await loaded
+        self.assertIs(True, await path_finder.save_liquidity_hints())
+        other = sqlite3.connect(self.cdb.path)
+        other.execute("DROP TABLE path_finder_state")
+        other.commit()
+        other.close()
+        with self.assertLogs('electrum', level='WARNING') as logs:
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            self.assertIs(False, await path_finder.save_liquidity_hints())
+        self.assertIn('could not save the liquidity hints', '\n'.join(logs.output))
+        self.assertTrue(self._cannot_send(path_finder, 42))
+        await self.cdb.save_synced_until(1)  # the db goes on working
+
+    async def test_reset_liquidity_hints_also_forgets_those_of_earlier_sessions(self):
+        for use_before_reset, use_after_reset in ((True, True), (False, True), (True, False), (False, False)):
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            await path_finder.save_liquidity_hints()
+            await self._end_session(cdb)
+
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            if use_before_reset:
+                path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000, failing_channel=channel(43))
+                self.assertTrue(self._cannot_send(path_finder, 42))
+            await path_finder.reset_liquidity_hints()
+            self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
+            if not use_after_reset:  # the reset by itself is on disk
+                await self._end_session(cdb)
+                cdb, path_finder, loaded = self._new_session()
+                await loaded
+                self.assertIsNone(path_finder.find_path_for_payment(
+                    nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
+                self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
+                await self._end_session(cdb)
+                continue
+            path_finder.update_liquidity_hints(self._liquidity_route(44), 1_000_000)  # they do not come back
+            self.assertFalse(self._cannot_send(path_finder, 42))
+            await path_finder.save_liquidity_hints()
+            await self._end_session(cdb)
+
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            path_finder.update_liquidity_hints(self._liquidity_route(45), 1_000_000)
+            self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
+            await path_finder.reset_liquidity_hints()
+            await self._end_session(cdb)
+
+    async def test_saved_liquidity_hints_that_cannot_be_read_are_ignored_and_replaced(self):
+        for garbage in ('not json', '{"version": 99}', '[]'):
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            await cdb.save_liquidity_hints(garbage)
+            await self._end_session(cdb)
+
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            with self.assertLogs('electrum', level='WARNING') as logs:
+                path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            self.assertIn('could not load the liquidity hints', '\n'.join(logs.output))
+            self.assertTrue(self._cannot_send(path_finder, 42))
+            await path_finder.save_liquidity_hints()
+            await self._end_session(cdb)
+
+            cdb, path_finder, loaded = self._new_session()
+            await loaded
+            path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000)
+            self.assertTrue(self._cannot_send(path_finder, 42))
+            await path_finder.reset_liquidity_hints()
+            await self._end_session(cdb)
 
     def test_reset_liquidity_hints_clears_inflight_htlcs(self):
         liquidity_hints = LiquidityHintMgr()

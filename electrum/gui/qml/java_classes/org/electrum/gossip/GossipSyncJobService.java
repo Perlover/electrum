@@ -1,5 +1,6 @@
 package org.electrum.gossip;
 
+import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.job.JobInfo;
 import android.app.job.JobParameters;
@@ -10,10 +11,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PersistableBundle;
+import android.os.PowerManager;
+import android.provider.Settings;
 import android.util.Log;
 
 import java.util.List;
@@ -99,6 +103,44 @@ public class GossipSyncJobService extends JobService {
     public static boolean isScheduled(Context context) {
         JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         return scheduler.getPendingJob(JOB_ID) != null;
+    }
+
+    /**
+     * Whether the user exempted the app from battery optimizations. If not, the OS may delay
+     * the job by hours, or even a day, once the app has not been used for a while.
+     */
+    public static boolean isIgnoringBatteryOptimizations(Context context) {
+        PowerManager powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        return powerManager.isIgnoringBatteryOptimizations(context.getPackageName());
+    }
+
+    /**
+     * Lets the user exempt the app from battery optimizations: with the dialog of the OS if the
+     * build declares the permission for that (app stores restrict it), else with the list
+     * in the settings of the OS, where the user has to find the app.
+     */
+    public static boolean requestIgnoreBatteryOptimizations(Context context) {
+        boolean canAskDirectly = context.checkSelfPermission(
+                "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS") == PackageManager.PERMISSION_GRANTED;
+        if (canAskDirectly && tryStartActivity(context, new Intent(
+                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:" + context.getPackageName())))) {
+            return true;
+        }
+        return tryStartActivity(context, new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+    }
+
+    private static boolean tryStartActivity(Context context, Intent intent) {
+        if (!(context instanceof Activity)) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        }
+        try {
+            context.startActivity(intent);
+            return true;
+        } catch (RuntimeException e) {  // some devices lack these screens
+            Log.w(TAG, "could not open " + intent.getAction(), e);
+            return false;
+        }
     }
 
     /**

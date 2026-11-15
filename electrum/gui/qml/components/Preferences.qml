@@ -413,6 +413,8 @@ Pane {
                                         })
                                         dialog.accepted.connect(function() {
                                             Config.useGossip = true
+                                            if (Network.backgroundRestricted && !Config.gossipBackgroundSyncBatteryAsked)
+                                                app.askUnrestrictedBackground()
                                         })
                                         dialog.rejected.connect(function() {
                                             checked = true // revert
@@ -440,8 +442,11 @@ Pane {
                         Switch {
                             id: gossipBackgroundSync
                             onCheckedChanged: {
-                                if (activeFocus)
+                                if (activeFocus) {
                                     Config.gossipBackgroundSync = checked
+                                    if (checked && Network.backgroundRestricted)
+                                        app.askUnrestrictedBackground()
+                                }
                             }
                         }
                         Label {
@@ -511,6 +516,23 @@ Pane {
                             Layout.fillWidth: true
                             text: qsTr('Only while charging')
                             wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: constants.paddingXLarge
+                        visible: Network.backgroundRestricted
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Android restricts this app in the background: updates can be hours late.')
+                            color: constants.colorWarning
+                            wrapMode: Text.Wrap
+                        }
+                        Button {
+                            text: qsTr('Allow')
+                            onClicked: Network.requestUnrestrictedBackground()
                         }
                     }
 

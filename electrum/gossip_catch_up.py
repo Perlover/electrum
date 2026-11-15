@@ -284,9 +284,22 @@ class BackgroundCatchUpManager:
             charging_only = config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY
             is_scheduled = self.job_service.schedule(self.context, interval, unmetered_only, charging_only)
             _logger.info(f"catch-up on gossip in the background every {interval} minutes. "
-                         f"{unmetered_only=}, {charging_only=}, {is_scheduled=}")
+                         f"{unmetered_only=}, {charging_only=}, {is_scheduled=}, "
+                         f"restricted_by_the_os={self.is_restricted_by_the_os()}")
         else:
             self.job_service.cancel(self.context)
+
+    def is_restricted_by_the_os(self) -> bool:
+        """Whether the catch-ups are on, but the OS optimizes the battery use of the app: it then
+        delays background work, by hours or a day once the app has not been used for a while."""
+        config = self.config
+        if not (config.LIGHTNING_USE_GOSSIP and config.LIGHTNING_GOSSIP_BACKGROUND_SYNC):
+            return False
+        return not self.job_service.isIgnoringBatteryOptimizations(self.context)
+
+    def request_to_lift_restriction(self) -> bool:
+        """Shows what the OS has for the user to exempt the app. Returns whether that got shown."""
+        return bool(self.job_service.requestIgnoreBatteryOptimizations(self.context))
 
     def poll(self, network: Optional['Network']) -> None:
         """If the OS woke the app up to catch up on gossip, this tells it when that is done,

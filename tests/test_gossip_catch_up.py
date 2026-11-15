@@ -273,6 +273,10 @@ class TestGossipCatchUp(ElectrumTestCase):
         for name in ('GossipSyncJobService', 'GossipSyncService'):
             self.assertIn(f'android:name="org.electrum.gossip.{name}"', hook)
             self.assertTrue(os.path.exists(os.path.join(java_dir, name + '.java')))
+        # what python calls on the job service
+        for signature in ('boolean isIgnoringBatteryOptimizations(Context context)',
+                          'boolean requestIgnoreBatteryOptimizations(Context context)'):
+            self.assertIn('public static ' + signature, job_service)
 
     async def test_nothing_is_done_while_the_app_uses_the_gossip_db(self):
         app_lock = GossipDbLock(self.config)
@@ -499,6 +503,30 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
         self.assertIs(job_service_class, manager.job_service)
         self.assertIs(activity_class.mActivity, manager.context)
         self.assertFalse(manager.is_started)
+
+    def test_app_is_restricted_while_the_os_optimizes_its_battery_use(self):
+        self.job_service.isIgnoringBatteryOptimizations.return_value = False
+        self.assertTrue(self.manager.is_restricted_by_the_os())
+        self.job_service.isIgnoringBatteryOptimizations.assert_called_with(self.context)
+        self.job_service.isIgnoringBatteryOptimizations.return_value = True  # the user exempted the app
+        self.assertFalse(self.manager.is_restricted_by_the_os())
+
+    def test_restriction_does_not_matter_if_nothing_is_to_run_in_the_background(self):
+        self.job_service.isIgnoringBatteryOptimizations.return_value = False
+        self.config.LIGHTNING_GOSSIP_BACKGROUND_SYNC = False
+        self.assertFalse(self.manager.is_restricted_by_the_os())
+        self.config.LIGHTNING_GOSSIP_BACKGROUND_SYNC = True
+        self.assertTrue(self.manager.is_restricted_by_the_os())
+        self.config.LIGHTNING_USE_GOSSIP = False  # trampoline
+        self.assertFalse(self.manager.is_restricted_by_the_os())
+        self.job_service.requestIgnoreBatteryOptimizations.assert_not_called()
+
+    def test_request_to_lift_the_restriction_tells_if_the_os_showed_something(self):
+        self.job_service.requestIgnoreBatteryOptimizations.return_value = True
+        self.assertIs(True, self.manager.request_to_lift_restriction())
+        self.job_service.requestIgnoreBatteryOptimizations.assert_called_once_with(self.context)
+        self.job_service.requestIgnoreBatteryOptimizations.return_value = False  # the device has no such screen
+        self.assertIs(False, self.manager.request_to_lift_restriction())
 
     def test_poll_lets_the_job_go_if_there_is_no_gossip_to_wait_for(self):
         self.job_service.isJobRunningInApp.return_value = True

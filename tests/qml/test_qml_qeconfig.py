@@ -176,3 +176,11 @@ class TestConfig(QETestCase):
         self.assertEqual(240, config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_INTERVAL)
         self.assertFalse(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_UNMETERED_ONLY)
         self.assertTrue(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY)
+        # whether we asked the user about the battery optimizations is remembered, and is not a setting of the job
+        asked = []
+        q.gossipBackgroundSyncBatteryAskedChanged.connect(lambda: asked.append(1))
+        self.assertFalse(q.gossipBackgroundSyncBatteryAsked)
+        q.gossipBackgroundSyncBatteryAsked = True
+        self.assertTrue(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED)
+        self.assertEqual([1], asked)
+        self.assertEqual(4, len(changes))

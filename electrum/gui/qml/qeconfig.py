@@ -218,6 +218,17 @@ class QEConfig(AuthMixin, QObject):
         self.config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY = enable
         self.gossipBackgroundSyncChanged.emit()
 
+    gossipBackgroundSyncBatteryAskedChanged = pyqtSignal()
+    @pyqtProperty(bool, notify=gossipBackgroundSyncBatteryAskedChanged)
+    def gossipBackgroundSyncBatteryAsked(self):
+        """whether we already asked the user, by ourselves, to exempt the app from battery optimizations"""
+        return self.config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED
+
+    @gossipBackgroundSyncBatteryAsked.setter
+    def gossipBackgroundSyncBatteryAsked(self, asked):
+        self.config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED = asked
+        self.gossipBackgroundSyncBatteryAskedChanged.emit()
+
     enableDebugLogsChanged = pyqtSignal()
     @pyqtProperty(bool, notify=enableDebugLogsChanged)
     def enableDebugLogs(self):

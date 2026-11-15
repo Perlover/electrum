@@ -36,6 +36,7 @@ class QENetwork(QObject, QtEventListener):
     chaintipsChanged = pyqtSignal()
     isLaggingChanged = pyqtSignal()
     gossipUpdated = pyqtSignal()
+    backgroundRestrictedChanged = pyqtSignal()
 
     # shared signal for static properties
     dataChanged = pyqtSignal()
@@ -80,6 +81,8 @@ class QENetwork(QObject, QtEventListener):
         asyncio.run_coroutine_threadsafe(manager.poll_loop(self.network), self.network.asyncio_loop)
         QEConfig.instance.useGossipChanged.connect(manager.update_schedule)
         QEConfig.instance.gossipBackgroundSyncChanged.connect(manager.update_schedule)
+        QEConfig.instance.useGossipChanged.connect(self.backgroundRestrictedChanged)
+        QEConfig.instance.gossipBackgroundSyncChanged.connect(self.backgroundRestrictedChanged)
         if not manager.is_started:  # normally done already, before the daemon got created
             manager.on_app_start()
 
@@ -311,6 +314,30 @@ class QENetwork(QObject, QtEventListener):
     @pyqtProperty('QVariant', notify=feeHistogramUpdated)
     def feeHistogram(self):
         return self._fee_histogram
+
+    @pyqtProperty(bool, notify=backgroundRestrictedChanged)
+    def backgroundRestricted(self):
+        """whether android optimizes our battery use, which delays the updates of the gossip in the background"""
+        manager = self._background_catch_up
+        try:
+            return bool(manager and manager.is_restricted_by_the_os())
+        except Exception:
+            self._logger.exception("could not tell whether the OS restricts us in the background")
+            return False
+
+    @pyqtSlot()
+    def refreshBackgroundRestricted(self):
+        """to be called when the user comes back to the app: they might have changed it in the settings of the OS"""
+        self.backgroundRestrictedChanged.emit()
+
+    @pyqtSlot()
+    def requestUnrestrictedBackground(self):
+        manager = self._background_catch_up
+        try:
+            if manager:
+                manager.request_to_lift_restriction()
+        except Exception:
+            self._logger.exception("could not open the battery settings of the OS")
 
     def _last_background_catch_up_text(self) -> str:
         """when the gossip was last updated while the app was not in use. empty if never, or not this session"""

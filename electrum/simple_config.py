@@ -771,6 +771,10 @@ With this option, the app updates the graph every few hours while it is not in u
         'lightning_gossip_background_sync_unmetered_only', default=True, type_=bool,
         short_desc=lambda: _("Only on unmetered networks (Wi-Fi)"),
     )
+    # whether we already asked the user to exempt the app from battery optimizations
+    LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED = ConfigVar(
+        'lightning_gossip_background_sync_battery_asked', default=False, type_=bool,
+    )
     LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY = ConfigVar(
         'lightning_gossip_background_sync_charging_only', default=False, type_=bool,
         short_desc=lambda: _("Only while charging"),

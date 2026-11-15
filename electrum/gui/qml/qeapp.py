@@ -83,7 +83,10 @@ def _collect_routing_log(
         'requesting channel graph', 'Received ', 'Deleting ', 'ignoring its channel range',
         'sent htlc', 'htlc failed', 'htlc succeeded', 'found a path', 'applied channel update',
         'path finding with the penalties', 'no path found within the fee budget', 'within the budget.',
-        'is likely offline')))
+        'is likely offline',
+        'on gossip', 'gossip backlog', 'lost all gossip peers', 'query_short_channel_ids timed out',
+        'woken up in the background', 'node announcements with an invalid signature', 'no gossip from our peers',
+        'does not respond. disconnecting', 'gossip sync tick failed')))
     files = sorted(glob.glob(os.path.join(log_dir, '*.log*')), key=os.path.getmtime, reverse=True)[:max_files]
     lines = []  # oldest first
     for fn in reversed(files):

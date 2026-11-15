@@ -413,9 +413,123 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
         manager.on_app_start()
         self.assertEqual({'started': 5}, manager.last_catch_up)
 
-    def test_poll_lets_the_job_go_once_gossip_has_caught_up(self):
+    @staticmethod
+    def _lngossip(*, num_peers: int = 4, is_caught_up: bool = False, is_paused: bool = False) -> mock.Mock:
         lngossip = mock.Mock()
-        lngossip.lnpeermgr.num_peers.return_value = 4
+        lngossip.lnpeermgr.num_peers.return_value = num_peers
+        lngossip.is_caught_up.return_value = is_caught_up
+        lngossip.is_paused.return_value = is_paused
+        lngossip.get_gossip_synced_until.return_value = 1_800_000_000
+        lngossip.pause.side_effect = lambda: setattr(lngossip.is_paused, 'return_value', True)
+        lngossip.resume.side_effect = lambda: setattr(lngossip.is_paused, 'return_value', False)
+        return lngossip
+
+    def test_gossip_is_paused_once_the_app_has_been_in_the_background_for_a_while(self):
+        lngossip = self._lngossip(is_caught_up=True)
+        network = mock.Mock(lngossip=lngossip)
+        self.job_service.isJobRunningInApp.return_value = False
+        grace = self.manager.BACKGROUND_GRACE
+        self.assertEqual(5 * 60, grace)
+        now = [1000.]
+        with mock.patch.object(gossip_catch_up.time, 'monotonic', lambda: now[0]):
+            # in use: never
+            now[0] += 10 * grace
+            self.manager.poll(network)
+            lngossip.pause.assert_not_called()
+            # the user leaves: first the app gets inactive, then suspended
+            self.manager.set_app_in_background(True)
+            now[0] += 10
+            self.manager.set_app_in_background(True)
+            now[0] += grace - 11
+            self.manager.poll(network)
+            lngossip.pause.assert_not_called()
+            now[0] += 1
+            self.manager.poll(network)
+            lngossip.pause.assert_called_once_with()
+            now[0] += 3600
+            self.manager.poll(network)
+            lngossip.pause.assert_called_once_with()
+            lngossip.resume.assert_not_called()
+            # the user comes back
+            self.manager.set_app_in_background(False)
+            self.manager.poll(network)
+            lngossip.resume.assert_called_once_with()
+            self.manager.poll(network)
+            lngossip.resume.assert_called_once_with()
+            # leaving for a moment, e.g. to copy an invoice from another app, does not pause it
+            for _ in range(5):
+                self.manager.set_app_in_background(True)
+                now[0] += grace - 1
+                self.manager.poll(network)
+                self.manager.set_app_in_background(False)
+                now[0] += 5
+                self.manager.poll(network)
+            lngossip.pause.assert_called_once_with()
+        self.job_service.finishJobInApp.assert_not_called()
+
+    def test_gossip_is_resumed_for_the_job_and_paused_again_after_it(self):
+        lngossip = self._lngossip(is_paused=True)
+        network = mock.Mock(lngossip=lngossip)
+        now = [1000.]
+        with mock.patch.object(gossip_catch_up.time, 'monotonic', lambda: now[0]):
+            self.manager.set_app_in_background(True)
+            now[0] += 2 * 3600
+            self.job_service.isJobRunningInApp.return_value = True
+            self.manager.poll(network)
+            lngossip.resume.assert_called_once_with()
+            lngossip.pause.assert_not_called()
+            self.job_service.finishJobInApp.assert_not_called()
+            now[0] += 90
+            lngossip.is_caught_up.return_value = True
+            self.manager.poll(network)
+            self.job_service.finishJobInApp.assert_called_once_with()
+            lngossip.pause.assert_not_called()
+            self.job_service.isJobRunningInApp.return_value = False
+            now[0] += 5
+            self.manager.poll(network)
+            lngossip.pause.assert_called_once_with()
+            lngossip.resume.assert_called_once_with()
+
+    def test_job_in_the_app_is_recorded_with_the_traffic_of_the_app(self):
+        lngossip = self._lngossip(is_paused=True)
+        network = mock.Mock(lngossip=lngossip)
+        now = [1000.]
+        traffic = [5_000_000, 100_000]
+        with mock.patch.object(gossip_catch_up.time, 'monotonic', lambda: now[0]), \
+                mock.patch.object(gossip_catch_up, '_android_traffic', lambda: list(traffic)):
+            self.manager.on_app_start()  # from here on the traffic is counted
+            self.manager.set_app_in_background(True)
+            now[0] += 7200
+            traffic[0] += 40_000
+            traffic[1] += 9_000
+            self.job_service.isJobRunningInApp.return_value = True
+            self.manager.poll(network)
+            now[0] += 95
+            traffic[0] += 4_000_000
+            traffic[1] += 60_000
+            lngossip.is_caught_up.return_value = True
+            with self.assertLogs('electrum', level='INFO') as logs:
+                self.manager.poll(network)
+        entry, = gossip_catch_up.read_history(self.config)
+        self.assertEqual(
+            {'in_app': True, 'caught_up': True, 'synced_until': 1_800_000_000,
+             'idle_seconds': 7200, 'idle_rx_bytes': 40_000, 'idle_tx_bytes': 9_000,
+             'seconds': 95, 'rx_bytes': 4_000_000, 'tx_bytes': 60_000},
+            {k: v for k, v in entry.items() if k not in ('started', 'finished')})
+        self.assertLessEqual(entry['started'], entry['finished'])
+        self.assertEqual(entry, self.manager.last_catch_up)
+        self.assertIn('woken up in the background: gossip has caught up. {', '\n'.join(logs.output))
+        self.assertIn('"rx_bytes": 4000000', '\n'.join(logs.output))
+
+    def test_job_is_let_go_even_if_it_cannot_be_recorded(self):
+        lngossip = self._lngossip(is_caught_up=True)
+        self.job_service.isJobRunningInApp.return_value = True
+        with mock.patch.object(gossip_catch_up, '_save_history_entry', side_effect=OSError("disk full")):
+            self.manager.poll(mock.Mock(lngossip=lngossip))
+        self.job_service.finishJobInApp.assert_called_once_with()
+
+    def test_poll_lets_the_job_go_once_gossip_has_caught_up(self):
+        lngossip = self._lngossip()
         network = mock.Mock(lngossip=lngossip)
         self.job_service.isJobRunningInApp.return_value = False
         lngossip.is_caught_up.return_value = True
@@ -430,8 +544,7 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
         self.job_service.finishJobInApp.assert_called_once_with()
 
     def test_poll_lets_the_job_go_if_no_node_can_be_reached(self):
-        lngossip = mock.Mock()
-        lngossip.is_caught_up.return_value = False
+        lngossip = self._lngossip()
         network = mock.Mock(lngossip=lngossip)
         self.job_service.isJobRunningInApp.return_value = True
         now = [1000.]
@@ -453,8 +566,7 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
             self.job_service.finishJobInApp.assert_called_once_with()
 
     def test_poll_keeps_the_job_if_the_peers_are_lost_for_a_moment(self):
-        lngossip = mock.Mock()
-        lngossip.is_caught_up.return_value = False
+        lngossip = self._lngossip()
         network = mock.Mock(lngossip=lngossip)
         self.job_service.isJobRunningInApp.return_value = True
         now = [1000.]
@@ -467,8 +579,7 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
 
     def test_poll_lets_the_job_go_if_the_peers_it_had_are_gone_for_good(self):
         # the connections from before the OS suspended us still count as peers at first
-        lngossip = mock.Mock()
-        lngossip.is_caught_up.return_value = False
+        lngossip = self._lngossip()
         network = mock.Mock(lngossip=lngossip)
         self.job_service.isJobRunningInApp.return_value = True
         now = [1000.]
@@ -530,9 +641,12 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
 
     def test_poll_lets_the_job_go_if_there_is_no_gossip_to_wait_for(self):
         self.job_service.isJobRunningInApp.return_value = True
-        self.manager.poll(mock.Mock(lngossip=None))  # trampoline
+        self.manager.poll(mock.Mock(lngossip=None))  # trampoline, or the gossip has not been started yet
         self.manager.poll(None)  # offline
         self.assertEqual(2, self.job_service.finishJobInApp.call_count)
+        # that is not a catch-up to remember
+        self.assertEqual([], gossip_catch_up.read_history(self.config))
+        self.assertIsNone(self.manager.last_catch_up)
 
     async def test_poll_loop_keeps_polling_after_a_failure(self):
         polled = []

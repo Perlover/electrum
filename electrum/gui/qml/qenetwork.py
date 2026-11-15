@@ -2,7 +2,8 @@ import asyncio
 import os
 from typing import TYPE_CHECKING, Optional
 
-from PyQt6.QtCore import pyqtProperty, pyqtSignal, QObject, pyqtSlot
+from PyQt6.QtCore import pyqtProperty, pyqtSignal, QObject, pyqtSlot, Qt
+from PyQt6.QtGui import QGuiApplication
 
 from electrum.logging import get_logger
 from electrum import constants
@@ -85,6 +86,19 @@ class QENetwork(QObject, QtEventListener):
         QEConfig.instance.gossipBackgroundSyncChanged.connect(self.backgroundRestrictedChanged)
         if not manager.is_started:  # normally done already, before the daemon got created
             manager.on_app_start()
+        app = QGuiApplication.instance()
+        if app is not None:
+            app.applicationStateChanged.connect(self._on_application_state_changed)
+
+    def _on_application_state_changed(self, state):
+        """the user left the app, or came back to it"""
+        try:
+            manager = self._background_catch_up
+            manager.set_app_in_background(state != Qt.ApplicationState.ApplicationActive)
+            # not to wait for its next poll, e.g. to resume the gossip right when the user comes back
+            self.network.asyncio_loop.call_soon_threadsafe(manager.poll_safely, self.network)
+        except Exception:
+            self._logger.exception("could not handle the change of the application state")
 
     def on_destroy(self):
         self.unregister_callbacks()

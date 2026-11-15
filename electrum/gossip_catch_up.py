@@ -14,7 +14,7 @@ import asyncio
 import json
 import os
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from aiorpcx import ignore_after
 
@@ -231,6 +231,11 @@ class BackgroundCatchUpManager:
     MIN_INTERVAL = 15  # minutes. the OS does not run periodic jobs more often
     NUM_HISTORY_ENTRIES_TO_LOG = 30
     POLL_INTERVAL = 5  # seconds
+    # Some systems suspend an app soon after the user leaves it, others let it run for hours (e.g. if the
+    # user exempted it from battery optimizations). So that the gossip does not go on arriving for as long,
+    # also on a metered network, we pause it ourselves once the app has been in the background for this
+    # long. The catch-ups the OS wakes us up for, and the user coming back, resume it.
+    BACKGROUND_GRACE = 5 * 60  # seconds
 
     _android_app_instance = None  # type: Optional[BackgroundCatchUpManager]
 
@@ -244,6 +249,11 @@ class BackgroundCatchUpManager:
         # about the job that is keeping the app awake, if any: whether we saw it, and since when we have no peers
         self._job_seen = False
         self._job_no_peers_since = None  # type: Optional[float]
+        self._job_entry = None  # type: Optional[dict]  # what goes to the history about it
+        # since when (time.monotonic) the app is in the background, if it is. set by the GUI thread
+        self._background_since = None  # type: Optional[float]
+        # (time.monotonic, bytes received and sent by the app) when we last looked at the traffic counters
+        self._traffic_mark = None  # type: Optional[Tuple[float, List[int]]]
 
     @classmethod
     def for_android_app(cls, config: 'SimpleConfig') -> 'BackgroundCatchUpManager':
@@ -273,6 +283,7 @@ class BackgroundCatchUpManager:
             self.last_catch_up = history[-1] if history else None
         except Exception as e:
             _logger.warning(f"could not read the history of the catch-ups in the background: {e!r}")
+        self._traffic_since_mark(time.monotonic())  # from here on we count what the app uses
         self.update_schedule()
 
     def update_schedule(self) -> None:
@@ -301,14 +312,46 @@ class BackgroundCatchUpManager:
         """Shows what the OS has for the user to exempt the app. Returns whether that got shown."""
         return bool(self.job_service.requestIgnoreBatteryOptimizations(self.context))
 
+    def set_app_in_background(self, in_background: bool) -> None:
+        """To be called, from any thread, when the user leaves the app or comes back to it."""
+        if not in_background:
+            self._background_since = None
+        elif self._background_since is None:
+            self._background_since = time.monotonic()
+
+    def _traffic_since_mark(self, now: float) -> Optional[Tuple[int, int, int]]:
+        """Returns the seconds passed, and the bytes the app received and sent, since we last looked,
+        if the OS tells. The counters are those of the app as a whole, not only of the gossip."""
+        traffic = _android_traffic()
+        mark = self._traffic_mark
+        self._traffic_mark = (now, traffic) if traffic else None
+        if not traffic or not mark:
+            return None
+        then, traffic_then = mark
+        return round(now - then), traffic[0] - traffic_then[0], traffic[1] - traffic_then[1]
+
     def poll(self, network: Optional['Network']) -> None:
-        """If the OS woke the app up to catch up on gossip, this tells it when that is done,
-        so that it can suspend the app again."""
-        if not self.job_service.isJobRunningInApp():
-            self._job_seen = False
-            return
+        """Pauses the gossip while the app is in the background, and resumes it for the user, and for the
+        OS when it wakes the app up to catch up on gossip: this then tells it when that is done, so that
+        it can suspend the app again."""
         now = time.monotonic()
         lngossip = network.lngossip if network else None
+        is_job_running = self.job_service.isJobRunningInApp()
+        background_since = self._background_since
+        if lngossip is not None:
+            if is_job_running or background_since is None:
+                if lngossip.is_paused():
+                    lngossip.resume()
+            elif now - background_since >= self.BACKGROUND_GRACE and not lngossip.is_paused():
+                lngossip.pause()
+        if not is_job_running:
+            self._job_seen = False
+            return
+        if not self._job_seen:
+            self._job_entry = {'started': int(time.time()), 'in_app': True}
+            if idle := self._traffic_since_mark(now):
+                # what the app used since the previous catch-up, or since it started
+                self._job_entry['idle_seconds'], self._job_entry['idle_rx_bytes'], self._job_entry['idle_tx_bytes'] = idle
         if lngossip is not None and lngossip.lnpeermgr.num_peers() > 0:
             self._job_no_peers_since = None
         elif not self._job_seen or self._job_no_peers_since is None:
@@ -323,7 +366,20 @@ class BackgroundCatchUpManager:
             reason = "no node can be reached"
         else:
             return
-        _logger.info(f"woken up in the background: {reason}")
+        entry, self._job_entry = self._job_entry or {}, None
+        try:
+            entry['finished'] = int(time.time())
+            entry['caught_up'] = lngossip is not None and lngossip.is_caught_up()
+            if lngossip is not None:
+                entry['synced_until'] = lngossip.get_gossip_synced_until()
+            if used := self._traffic_since_mark(now):
+                entry['seconds'], entry['rx_bytes'], entry['tx_bytes'] = used
+            if 'started' in entry and lngossip is not None:  # else there was nothing to do, e.g. at startup
+                _save_history_entry(self.config, entry)
+                self.last_catch_up = entry
+        except Exception as e:
+            _logger.warning(f"could not record the catch-up in the background: {e!r}")
+        _logger.info(f"woken up in the background: {reason}. {json.dumps(entry, sort_keys=True, default=repr)}")
         self._job_seen = False
         self.job_service.finishJobInApp()
 
@@ -332,7 +388,10 @@ class BackgroundCatchUpManager:
         while the app is in the background."""
         while True:
             await asyncio.sleep(self.POLL_INTERVAL)
-            try:
-                self.poll(network)
-            except Exception as e:
-                _logger.warning(f"poll failed: {e!r}")
+            self.poll_safely(network)
+
+    def poll_safely(self, network: Optional['Network']) -> None:
+        try:
+            self.poll(network)
+        except Exception as e:
+            _logger.warning(f"poll failed: {e!r}")

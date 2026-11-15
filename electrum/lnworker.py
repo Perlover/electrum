@@ -251,6 +251,7 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.network = None  # type: Optional[Network]
         self.config = config
         self.stopping_soon = False  # whether we are being shut down
+        self.paused = False  # whether to refrain from connecting to peers, see LNGossip.pause()
         self.register_callbacks()
 
     def diagnostic_name(self):
@@ -332,6 +333,8 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
             await asyncio.sleep(1)
             if self.stopping_soon:
                 return
+            if self.paused:
+                continue
             now = time.time()
             if len(self._peers) >= NUM_PEERS_TARGET:
                 continue
@@ -754,6 +757,7 @@ class LNGossip(Logger):
         # peer -> (time, number of gossip messages received so far), for the last few ticks
         self._gossip_rx_samples = {}  # type: Dict[Peer, List[Tuple[float, int]]]
         self._gossip_last_tick = None  # type: Optional[float]
+        self._gossip_paused = False  # see pause()
         self._gossip_last_rx_time = 0.  # type: float  # when we last noticed that gossip arrived
         self._gossip_num_msgs_received = 0  # type: int
         self._gossip_synced_until_saved = 0.  # type: float
@@ -920,9 +924,46 @@ class LNGossip(Logger):
             return int(now), 0xFFFFFFFF
         return self._ask_for_gossip_backlog(peer, now)
 
+    def pause(self) -> None:
+        """Disconnects from the peers, and stays without gossip until resume(). The db and the path finder
+        go on as they are.
+
+        For a mobile app in the background: some systems suspend it, others let it run for hours, and then
+        the gossip would go on arriving for as long, also on a metered network.
+        To be called from the event loop."""
+        if self._gossip_paused:
+            return
+        self._gossip_paused = True
+        self.lnpeermgr.paused = True
+        self.logger.info("pausing gossip")
+        if self._gossip_sync_is_set_up:
+            if not self._gossip_catching_up:
+                self._advance_gossip_synced_until()
+            self._save_gossip_synced_until(force=True)
+        self._close_peers_while_paused()
+
+    def resume(self) -> None:
+        """Connects to peers again, and catches up on the gossip missed since pause().
+        To be called from the event loop."""
+        if not self._gossip_paused:
+            return
+        self._gossip_paused = False
+        self.lnpeermgr.paused = False
+        self.logger.info("resuming gossip")
+        if self._gossip_sync_is_set_up:
+            self._gossip_rx_samples = {}
+            self._start_gossip_catch_up()
+
+    def is_paused(self) -> bool:
+        return self._gossip_paused
+
+    def _close_peers_while_paused(self) -> None:
+        for peer in list(self.lnpeermgr.peers.values()):
+            peer.close_and_cleanup()
+
     def is_caught_up(self) -> bool:
         """Whether we received the gossip we missed while offline, and are now getting the new one."""
-        if not self._gossip_sync_is_set_up or self._gossip_catching_up:
+        if not self._gossip_sync_is_set_up or self._gossip_catching_up or self._gossip_paused:
             return False
         # if the tick is overdue then we were suspended, which the tick will notice in a moment
         last_tick = self._gossip_last_tick
@@ -946,6 +987,10 @@ class LNGossip(Logger):
     def _gossip_sync_tick(self) -> None:
         now = time.time()
         last_tick, self._gossip_last_tick = self._gossip_last_tick, now
+        if self._gossip_paused:
+            # a connection that was being made when we got paused might have been established since
+            self._close_peers_while_paused()
+            return
         peers = self._gossip_peers()
         num_samples = self.GOSSIP_CATCH_UP_QUIET_TICKS + 1
         self._gossip_rx_samples = {

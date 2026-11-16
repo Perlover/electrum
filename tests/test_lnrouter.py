@@ -938,6 +938,17 @@ class TestGossipBacklog(ElectrumTestCase):
             self.assertEqual([session_start - LNGossip.GOSSIP_SYNCED_MARGIN], c.requested, msg=interruption)
             self._catch_up(g, c)
 
+    async def test_a_new_peer_while_an_old_one_is_there_is_no_reason_to_catch_up(self):
+        # a quiet network: no gossip for a while, but peer a was connected all along
+        g = self._lngossip(synced_until=self.NOW - 3600, num_policies=500)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        self._tick(g, {a: 0}, times=6)
+        d = self._connect(g, 'd')  # a further peer, asked for new gossip only
+        self._tick(g, {a: 0, d: 0})
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(1, len(d.requested))
+
     async def test_peers_that_all_connected_after_we_last_had_gossip_make_us_catch_up(self):
         g = self._lngossip(synced_until=self.NOW - 3600)
         a, b = self._connect(g, 'a'), self._connect(g, 'b')
@@ -3416,35 +3427,38 @@ class Test_LNRouter(ElectrumTestCase):
         self.assertEqual(1_000_000, hints._node_cannot_receive[b][1][a].amount_msat)  # what we had
         self.assertEqual({a: policy, c: policy}, hints._node_failed_policies[b])
         self.assertEqual({c}, set(hints._node_cannot_receive[d][1]))
-        # what we learned about from an htlc since takes precedence (see the test above)
-        hints.update_can_send(a, c, channel(5), amount_msat=1000, policy=policy)
-        of_b.update_cannot_send(a, c, channel(6), amount_msat=2000, policy=policy)
-        hints.import_state(of_b.export_state())
-        self.assertNotIn((a, c), hints._pair_cannot_send)
-        self.assertNotIn(c, hints._node_cannot_receive)
-        hints.reset_liquidity_hints()  # nothing learned any more
-        hints.import_state(of_b.export_state())
-        self.assertIn((a, c), hints._pair_cannot_send)
-        self.assertIn(c, hints._node_cannot_receive)
 
-    def test_saved_hints_are_only_about_the_channels_and_nodes_given(self):
+    def test_saved_failures_that_a_later_forward_is_over_are_not_taken_over(self):
         a, b, c, d = node('a'), node('b'), node('c'), node('d')
         policy = (1000, 100, 40)
-        hints = LiquidityHintMgr()
-        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
-        hints.update_cannot_send(c, b, channel(2), amount_msat=1_000_000, policy=policy)
-        hints.update_can_send(c, d, channel(3), amount_msat=1_000_000, policy=policy)
-        state = hints.export_state(scids={channel(1), channel(3)}, nodes={a, b})
-        self.assertEqual({channel(1).hex(), channel(3).hex()}, set(state['channels']))
-        self.assertEqual([[a.hex(), b.hex()]], [pair[:2] for pair in state['pairs']])
-        self.assertEqual({b.hex(): {a.hex()}}, {n: set(failures) for n, failures in state['nodes'].items()})
-        self.assertEqual(({channel(1), channel(3)}, {a, b}), LiquidityHintMgr.channels_and_nodes_of_state(state))
-        everything = hints.export_state()
-        self.assertEqual(3, len(everything['channels']))
-        self.assertEqual(({channel(1), channel(2), channel(3)}, {a, b, c}),
-                         LiquidityHintMgr.channels_and_nodes_of_state(everything))
-        self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}},
-                         hints.export_state(scids=set(), nodes=set()))
+        start = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: start):
+            saved = LiquidityHintMgr()
+            saved.update_cannot_send(a, b, channel(1), amount_msat=2000, policy=policy)
+            saved.update_cannot_send(c, d, channel(2), amount_msat=2000, policy=policy)
+            state = saved.export_state()
+        with mock.patch.object(lnrouter, 'now', lambda: start + 10):
+            hints = LiquidityHintMgr()
+            # later: a forwarded a larger amount to b, which received it. c forwarded a smaller one to d
+            hints.update_can_send(a, b, channel(3), amount_msat=3000, policy=policy)
+            hints.update_can_send(a, b, channel(3), amount_msat=500, policy=policy)  # (the largest one counts)
+            hints.update_can_send(c, d, channel(4), amount_msat=1000, policy=policy)
+            # a failure of ours does not count: it does not tell the saved failures are over
+            hints.update_cannot_send(b, c, channel(5), amount_msat=1000, policy=policy)
+            hints.import_state(state)
+        self.assertEqual({(c, d), (b, c)}, set(hints._pair_cannot_send))
+        self.assertNotIn(b, hints._node_cannot_receive)
+        self.assertEqual({c}, set(hints._node_cannot_receive[d][1]))
+        # a forward before the failure tells nothing about it
+        with mock.patch.object(lnrouter, 'now', lambda: start - 10):
+            hints = LiquidityHintMgr()
+            hints.update_can_send(a, b, channel(3), amount_msat=3000, policy=policy)
+        with mock.patch.object(lnrouter, 'now', lambda: start + 10):
+            hints.import_state(state)
+        self.assertEqual({(a, b), (c, d)}, set(hints._pair_cannot_send))
+        hints.reset_liquidity_hints()
+        self.assertEqual({}, hints._pair_forwarded)
+        self.assertEqual({}, hints._node_received)
 
     def test_export_of_hints_does_not_fail_when_a_failure_expires_meanwhile(self):
         start = 1_800_000_000

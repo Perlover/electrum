@@ -799,39 +799,46 @@ class TestPeerDirect(TestPeer):
         # counted from the chain tip it waited for
         self.assertEqual([height + 2 + 150 + MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT], received)
 
-    async def test_buffer_to_the_final_cltv_delta_stays_within_the_budget(self):
-        graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
-        p1, p2 = graph.peers.values()
-        w1, w2 = graph.workers.values()
-        height = w1.network.get_local_height()
-        received = []
-        orig_on_update_add_htlc = p2.on_update_add_htlc
-        def on_update_add_htlc(chan, payload):
-            received.append(payload['cltv_expiry'])
-            return orig_on_update_add_htlc(chan, payload)
-        p2.on_update_add_htlc = on_update_add_htlc
-        budget_cltv = PaymentFeeBudget.from_invoice_amount(invoice_amount_msat=100_000_000, config=w1.config).cltv
-        self.assertEqual(NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE, budget_cltv)
+    async def test_buffer_to_the_final_cltv_delta_stays_within_the_limit_of_a_route(self):
+        # (min_final_cltv_delta of the invoice, cltv budget of the route to the destination or None for the
+        # default one, the cltv delta of the htlc the destination gets)
+        for min_final_cltv_delta, budget_cltv, expected in (
+                # an invoice that leaves less than the buffer within the limit, which it may
+                (NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE - 1, None, NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE),
+                # the budget is for the route, not for the final delta and its buffer (lnpay --max_cltv)
+                (144, 288 - 144, 144 + MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT),
+        ):
+            with self.subTest(min_final_cltv_delta=min_final_cltv_delta, budget_cltv=budget_cltv):
+                graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
+                p1, p2 = graph.peers.values()
+                w1, w2 = graph.workers.values()
+                height = w1.network.get_local_height()
+                received = []
+                orig_on_update_add_htlc = p2.on_update_add_htlc
+                def on_update_add_htlc(chan, payload, received=received, orig=orig_on_update_add_htlc):
+                    received.append(payload['cltv_expiry'])
+                    return orig(chan, payload)
+                p2.on_update_add_htlc = on_update_add_htlc
+                budget = None if budget_cltv is None else PaymentFeeBudget(fee_msat=1_000_000, cltv=budget_cltv)
 
-        async def pay():
-            # an invoice that leaves less than the buffer of the budget, which it may
-            lnaddr, pay_req = self.prepare_invoice(w2, min_final_cltv_delta=budget_cltv - 1)
-            result, log = await util.wait_for2(w1.pay_invoice(pay_req), timeout=3)
-            self.assertTrue(result, msg=log)
-            raise SuccessfulTest()
+                async def pay(w1=w1, w2=w2, budget=budget, min_final_cltv_delta=min_final_cltv_delta):
+                    lnaddr, pay_req = self.prepare_invoice(w2, min_final_cltv_delta=min_final_cltv_delta)
+                    result, log = await util.wait_for2(w1.pay_invoice(pay_req, budget=budget), timeout=3)
+                    self.assertTrue(result, msg=log)
+                    raise SuccessfulTest()
 
-        async def f():
-            async with OldTaskGroup() as group:
-                await group.spawn(p1._message_loop())
-                await group.spawn(p1.htlc_switch())
-                await group.spawn(p2._message_loop())
-                await group.spawn(p2.htlc_switch())
-                await asyncio.sleep(0.01)
-                await group.spawn(pay())
+                async def f(p1=p1, p2=p2, pay=pay):
+                    async with OldTaskGroup() as group:
+                        await group.spawn(p1._message_loop())
+                        await group.spawn(p1.htlc_switch())
+                        await group.spawn(p2._message_loop())
+                        await group.spawn(p2.htlc_switch())
+                        await asyncio.sleep(0.01)
+                        await group.spawn(pay())
 
-        with self.assertRaises(SuccessfulTest):
-            await f()
-        self.assertEqual([height + budget_cltv], received)
+                with self.assertRaises(SuccessfulTest):
+                    await f()
+                self.assertEqual([height + expected], received)
 
     async def test_payment_waits_for_the_chain_tip_but_not_forever(self):
         graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
@@ -4414,7 +4421,7 @@ class TestPeerForwarding(TestPeer):
             await f()
         self.assertEqual(amount, seen[0])  # known at the first path finding
 
-    async def test_wallets_sharing_the_path_finder_save_only_the_hints_of_their_own_routes(self):
+    async def test_wallets_sharing_the_path_finder_save_only_what_they_learned_themselves(self):
         import gc
         import weakref
         graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['square_graph'])
@@ -4424,37 +4431,44 @@ class TestPeerForwarding(TestPeer):
         def route(*hops):
             return [RouteEdge(start_node=n1, end_node=n2, short_channel_id=sc, fee_base_msat=1000,
                               fee_proportional_millionths=1, cltv_delta=144, node_features=0) for n1, n2, sc in hops]
-        policy = (1000, 1, 144)
-        # dave saved a failure of carol -> alice in an earlier session
+        ab, bd, cd, ac = scid[('alice', 'bob')], scid[('bob', 'dave')], scid[('carol', 'dave')], scid[('alice', 'carol')]
+        # dave saved failures in an earlier session: carol could not forward to alice, nor bob to dave
         earlier = LiquidityHintMgr()
-        earlier.update_cannot_send(c, a, scid[('alice', 'carol')], amount_msat=7_000_000, policy=policy)
+        earlier.update_cannot_send(c, a, ac, amount_msat=7_000_000, policy=(1000, 1, 144))
+        earlier.update_cannot_send(b, d, bd, amount_msat=8_000_000, policy=(1000, 1, 144))
         dave.db.put(LNWallet.LIQUIDITY_HINTS_DB_KEY, json.dumps(earlier.export_state()))
-        # one process: both wallets use the path finder of the network
+        # one process: both wallets use the path finder of the network. alice uses it first: bob could not
+        # forward to dave. it is a failure, which tells nothing about what dave saved
         dave.network.path_finder = alice.network.path_finder
         path_finder = alice._path_finder()
-        # alice pays: bob could not forward to dave
-        route_of_alice = route((a, b, scid[('alice', 'bob')]), (b, d, scid[('bob', 'dave')]))
-        path_finder.update_liquidity_hints(route_of_alice, 5_000_000, failing_channel=scid[('bob', 'dave')])
-        alice._save_liquidity_hints(path_finder, route_of_alice)
-        # dave takes over his saved hints, all of them, and pays carol
+        route_of_alice = route((a, b, ab), (b, d, bd))
+        alice._update_liquidity_hints(path_finder, route_of_alice, 5_000_000, failing_channel=bd)
+        # dave takes over all his saved hints, and pays over the same channels the other way round
         self.assertIs(path_finder, dave._path_finder())
         self.assertEqual(7_000_000, path_finder.liquidity_hints._pair_cannot_send[(c, a)][0].amount_msat)
-        route_of_dave = route((d, c, scid[('carol', 'dave')]))
-        path_finder.update_liquidity_hints(route_of_dave, 1_000_000)
-        dave._save_liquidity_hints(path_finder, route_of_dave)
+        self.assertEqual(5_000_000, path_finder.liquidity_hints._pair_cannot_send[(b, d)][0].amount_msat)
+        self.assertEqual({b}, set(path_finder.liquidity_hints._node_cannot_receive[d][1]))
+        route_of_dave = route((d, b, bd), (b, a, ab))
+        dave._update_liquidity_hints(path_finder, route_of_dave, 1_000_000)
         saved_by_dave = json.loads(dave.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
-        self.assertEqual({scid[('carol', 'dave')].hex(), scid[('alice', 'carol')].hex()}, set(saved_by_dave['channels']))
-        self.assertEqual([[c.hex(), a.hex()]], [pair[:2] for pair in saved_by_dave['pairs']])
-        self.assertEqual({a.hex()}, set(saved_by_dave['nodes']))
+        expected = LiquidityHintMgr()
+        expected.import_state(earlier.export_state())
+        expected.update_from_route(route_of_dave, 1_000_000)
+        self.assertEqual(expected.export_state(), saved_by_dave)  # all of his, and only his
+        self.assertNotIn('5000000', json.dumps(saved_by_dave))
         saved_by_alice = json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
-        self.assertEqual({scid[('alice', 'bob')].hex(), scid[('bob', 'dave')].hex()}, set(saved_by_alice['channels']))
-        self.assertEqual([[b.hex(), d.hex()]], [pair[:2] for pair in saved_by_alice['pairs']])
-        # the next save of alice does not take what dave brought in either
-        alice._save_liquidity_hints(path_finder, route_of_alice)
-        self.assertEqual(saved_by_alice, json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY)))
+        expected = LiquidityHintMgr()
+        expected.update_from_route(route_of_alice, 5_000_000, failing_channel=bd)
+        self.assertEqual(expected.export_state(), saved_by_alice)
+        self.assertNotIn(ac.hex(), saved_by_alice['channels'])
+        # after a restart of the gossip, the new path finder gets what the wallets have
+        alice.network.path_finder = dave.network.path_finder = LNPathFinder(alice.network.channel_db)
+        new_path_finder = dave._path_finder()
+        self.assertEqual(7_000_000, new_path_finder.liquidity_hints._pair_cannot_send[(c, a)][0].amount_msat)
+        self.assertIsNot(path_finder, new_path_finder)
         # the gossip stops: the wallets do not keep the path finder, and the graph with it, in memory
         old = weakref.ref(path_finder)
-        del path_finder
+        del path_finder, new_path_finder
         alice.network.path_finder = dave.network.path_finder = None
         self.assertIsNone(alice._path_finder())
         self.assertIsNone(dave._path_finder())
@@ -4462,10 +4476,23 @@ class TestPeerForwarding(TestPeer):
         self.assertIsNone(old())
         # a save that fails does not break the handling of the result of the htlc
         broken = mock.Mock(spec=LNPathFinder)
-        broken.liquidity_hints_to_save.side_effect = TypeError('a bug')
-        with self.assertLogs('electrum', level='ERROR'):
-            alice._save_liquidity_hints(broken, route_of_alice)
+        with mock.patch.object(LiquidityHintMgr, 'export_state', side_effect=TypeError('a bug')), \
+                self.assertLogs('electrum', level='ERROR'):
+            alice._update_liquidity_hints(broken, route_of_alice, 1000)
+        broken.update_liquidity_hints.assert_called_once()
         self.assertEqual(saved_by_alice, json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY)))
+
+    async def test_saved_liquidity_hints_that_cannot_be_read_are_replaced_by_what_we_learn(self):
+        graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['square_graph'])
+        alice = graph.workers['alice']
+        alice.db.put(LNWallet.LIQUIDITY_HINTS_DB_KEY, '{"version": 99}')
+        with self.assertLogs('electrum', level='WARNING'):
+            path_finder = alice._path_finder()
+        a, b = alice.node_keypair.pubkey, graph.workers['bob'].node_keypair.pubkey
+        edge = RouteEdge(start_node=a, end_node=b, short_channel_id=graph.channels[('alice', 'bob')][0].short_channel_id,
+                         fee_base_msat=0, fee_proportional_millionths=0, cltv_delta=144, node_features=0)
+        alice._update_liquidity_hints(path_finder, [edge], 1000)
+        self.assertEqual(1, json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))['version'])
 
     async def test_payment_with_temp_channel_failure_and_liquidity_hints(self):
         # prepare channels such that a temporary channel failure happens at c->d
@@ -4488,11 +4515,11 @@ class TestPeerForwarding(TestPeer):
         amount_to_pay = 100_000_000
         peers = graph.peers.values()
         saves = []  # what alice saved, after each htlc result
-        orig_save = graph.workers['alice']._save_liquidity_hints
-        def save(path_finder, route):
-            orig_save(path_finder, route)
+        orig_update = graph.workers['alice']._update_liquidity_hints
+        def update(*args, **kwargs):
+            orig_update(*args, **kwargs)
             saves.append(json.loads(graph.workers['alice'].db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY)))
-        graph.workers['alice']._save_liquidity_hints = save
+        graph.workers['alice']._update_liquidity_hints = update
         async def pay(lnaddr, pay_req):
             self.assertEqual(PR_UNPAID, graph.workers['dave'].get_payment_status(lnaddr.paymenthash, direction=RECEIVED))
             result, log = await graph.workers['alice'].pay_invoice(pay_req, attempts=3)

@@ -1958,6 +1958,10 @@ class Commands(Logger):
         if self.network.path_finder:
             self.network.path_finder.reset_liquidity_hints()
             self.network.path_finder.clear_blacklist()
+        # and those the wallets keep for the next session
+        for wallet in (self.daemon.get_wallets().values() if self.daemon else []):
+            if wallet.lnworker:
+                wallet.lnworker.forget_saved_liquidity_hints()
 
     @command('wnpl')
     async def close_channel(self, channel_point, force=False, password=None, wallet: Abstract_Wallet = None):

@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import json
 import itertools
 import shutil
 import copy
@@ -39,6 +40,7 @@ from electrum.lntransport import LNPeerAddr
 from electrum.crypto import privkey_to_pubkey, sha256d
 from electrum.lnutil import Keypair, PaymentFailure, LnFeatures, HTLCOwner, PaymentFeeBudget, RECEIVED
 from electrum.lnutil import MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT
+from electrum.commands import Commands
 from electrum.lnchannel import ChannelState, PeerState, Channel, CF_ANNOUNCE_CHANNEL
 from electrum.lnrouter import LNPathFinder, PathEdge, LNPathInconsistent
 from electrum.channel_db import ChannelDB, InvalidGossipMsg
@@ -4308,11 +4310,21 @@ class TestPeerForwarding(TestPeer):
         # 2. along a->b->d with success
         amount_to_pay = 100_000_000
         peers = graph.peers.values()
+        saves = []  # what alice saved, after each htlc result
+        orig_save = graph.workers['alice']._save_liquidity_hints
+        def save(path_finder):
+            orig_save(path_finder)
+            saves.append(json.loads(graph.workers['alice'].db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY)))
+        graph.workers['alice']._save_liquidity_hints = save
         async def pay(lnaddr, pay_req):
             self.assertEqual(PR_UNPAID, graph.workers['dave'].get_payment_status(lnaddr.paymenthash, direction=RECEIVED))
             result, log = await graph.workers['alice'].pay_invoice(pay_req, attempts=3)
             self.assertTrue(result)
             self.assertEqual(2, len(log))
+            # saved right after the failure already, in case we get killed before the next htlc
+            self.assertEqual(2, len(saves))
+            self.assertIn(graph.channels[('carol', 'dave')][0].short_channel_id.hex(), saves[0]['channels'])
+            self.assertNotIn(graph.channels[('bob', 'dave')][0].short_channel_id.hex(), saves[0]['channels'])
             self.assertEqual(PR_PAID, graph.workers['dave'].get_payment_status(lnaddr.paymenthash, direction=RECEIVED))
             self.assertEqual(OnionFailureCode.TEMPORARY_CHANNEL_FAILURE, log[0].failure_msg.code)
 
@@ -4335,6 +4347,31 @@ class TestPeerForwarding(TestPeer):
             self.assertEqual(None, hint_ab.cannot_send(pubkey_a < pubkey_b))
             self.assertEqual(amount_to_pay, hint_bd.can_send(pubkey_b < pubkey_d))
             self.assertEqual(None, hint_bd.cannot_send(pubkey_b < pubkey_d))
+
+            # what alice learned is in her wallet file, for the next session (but not in dave's)
+            alice = graph.workers['alice']
+            saved = json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
+            scid_cd = graph.channels[('carol', 'dave')][0].short_channel_id
+            scid_bd = graph.channels[('bob', 'dave')][0].short_channel_id
+            self.assertIn(scid_cd.hex(), saved['channels'])
+            self.assertIn(scid_bd.hex(), saved['channels'])  # the success came last, and is saved too
+            self.assertIsNone(graph.workers['dave'].db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
+            # after a restart, the path finder of the network is a new one: it gets them before it is used
+            alice.network.path_finder = LNPathFinder(alice.network.channel_db)
+            self.assertIsNone(alice.network.path_finder.liquidity_hints.get_hint(scid_cd).cannot_send(pubkey_c < pubkey_d))
+            path_finder = alice._path_finder()
+            self.assertIs(alice.network.path_finder, path_finder)
+            self.assertEqual(amount_to_pay, path_finder.liquidity_hints.get_hint(scid_cd).cannot_send(pubkey_c < pubkey_d))
+            # only once: a reset of the path finder alone does not bring them back
+            path_finder.reset_liquidity_hints()
+            alice._path_finder()
+            self.assertIsNone(path_finder.liquidity_hints.get_hint(scid_cd).cannot_send(pubkey_c < pubkey_d))
+            # the reset command forgets them, also in the wallet files
+            alice.network.daemon = mock.Mock()
+            alice.network.daemon.get_wallets.return_value = {'alice': alice.wallet, 'dave': graph.workers['dave'].wallet}
+            await Commands(config=alice.config, network=alice.network, daemon=alice.network.daemon).reset_liquidity_hints()
+            self.assertIsNone(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
+            self.assertEqual({}, json.loads(path_finder.liquidity_hints_to_save())['channels'])
 
             raise PaymentDone()
         async def f():

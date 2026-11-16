@@ -3387,84 +3387,36 @@ class Test_LNRouter(ElectrumTestCase):
                 RouteEdge(start_node=a, end_node=b, short_channel_id=channel(number), fee_base_msat=1000,
                           fee_proportional_millionths=100, cltv_delta=40, node_features=0)]
 
-    def _new_session(self, *, load_data: bool = True):
-        """returns the channel db and the path finder of a new session, over the same files"""
-        class fake_network:
-            config = self.config
-            asyncio_loop = util.get_asyncio_loop()
-            trigger_callback = lambda *args: None
-            register_callback = lambda *args: None
-            interface = None
-        cdb = lnrouter.ChannelDB(fake_network())
-        return cdb, lnrouter.LNPathFinder(cdb), (cdb.load_data() if load_data else None)
-
-    async def _end_session(self, cdb):
-        cdb.stop()
-        await cdb.stopped_event.wait()
+    @staticmethod
+    def _path_finder():
+        # without a graph: these tests do not look for paths
+        return lnrouter.LNPathFinder(mock.Mock(spec=lnrouter.ChannelDB))
 
     def _cannot_send(self, path_finder, number: int) -> bool:
         return inf == path_finder.liquidity_hints.penalty(
             node('a'), node('b'), channel(number), amount_msat=1_000_000, policy=(1000, 100, 40))
 
-    async def test_liquidity_hints_are_kept_for_the_next_session(self):
-        cdb, path_finder, loaded = self._new_session()
-        await loaded
+    async def test_liquidity_hints_are_saved_and_taken_over_by_the_path_finder_of_a_new_session(self):
+        path_finder = self._path_finder()
+        self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}},
+                         json.loads(path_finder.liquidity_hints_to_save()))
         path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-        self.assertTrue(self._cannot_send(path_finder, 42))
-        await path_finder.save_liquidity_hints()
-        # they are on disk already, in case we get killed: another connection sees them
-        other = sqlite3.connect(cdb.path)
-        (saved,), = other.execute("SELECT value FROM path_finder_state WHERE key='liquidity_hints'").fetchall()
-        other.close()
-        self.assertEqual({channel(40).hex(), channel(42).hex()}, set(json.loads(saved)['channels']))
-        await self._end_session(cdb)
-
-        self.cdb, path_finder, loaded = self._new_session()
-        await loaded
-        self.assertFalse(self._cannot_send(path_finder, 42))
-        # they are taken over when the path finder gets used
-        self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
-        self.assertTrue(self._cannot_send(path_finder, 42))
-        self.assertEqual(0, path_finder.liquidity_hints.penalty(
-            node('s'), node('a'), channel(40), amount_msat=1_000_000, policy=(0, 0, 40)))
-
-    async def test_liquidity_hints_are_saved_after_each_htlc(self):
-        cdb, path_finder, loaded = self._new_session()
-        await loaded
-        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-        path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000)
-        await cdb.save_synced_until(1)  # what we asked the db for before this is done
-        await self._end_session(cdb)
-        self.cdb, path_finder, loaded = self._new_session()
-        await loaded
-        self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
-        self.assertEqual([True, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
-        # also that 43 forwarded the amount after 42 failed, which ended the failure of the node pair
-        self.assertEqual(0, path_finder.liquidity_hints.penalty(
-            node('a'), node('b'), channel(43), amount_msat=1_000_000, policy=(1000, 100, 40)))
-        self.assertEqual({}, path_finder.liquidity_hints._pair_cannot_send)
-
-    async def test_liquidity_hints_of_earlier_sessions_are_not_overwritten_before_the_db_is_loaded(self):
-        cdb, path_finder, loaded = self._new_session()
-        await loaded
-        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-        await path_finder.save_liquidity_hints()
-        await self._end_session(cdb)
-
-        cdb, path_finder, _ = self._new_session(load_data=False)
-        path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000, failing_channel=channel(43))
-        self.assertIsNone(path_finder.save_liquidity_hints())
-        self.assertEqual([False, True], [self._cannot_send(path_finder, number) for number in (42, 43)])
-        await cdb.load_data()
-        path_finder.update_liquidity_hints(self._liquidity_route(44), 1_000_000, failing_channel=channel(44))
-        self.assertEqual([True, True, True], [self._cannot_send(path_finder, number) for number in (42, 43, 44)])
-        await path_finder.save_liquidity_hints()
-        await self._end_session(cdb)
-
-        self.cdb, path_finder, loaded = self._new_session()
-        await loaded
-        path_finder.update_liquidity_hints(self._liquidity_route(45), 1_000_000)
-        self.assertEqual([True, True, True], [self._cannot_send(path_finder, number) for number in (42, 43, 44)])
+        path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
+        saved = path_finder.liquidity_hints_to_save()
+        self.assertEqual({channel(40).hex(), channel(42).hex(), channel(43).hex()}, set(json.loads(saved)['channels']))
+        new = self._path_finder()
+        self.assertFalse(self._cannot_send(new, 42))
+        with self.assertLogs('electrum', level='INFO') as logs:
+            new.import_saved_liquidity_hints(saved)
+        self.assertIn('loaded 5 liquidity hints of earlier sessions', '\n'.join(logs.output))  # 3 channels, pair, node
+        self.assertTrue(self._cannot_send(new, 42))
+        self.assertEqual(0, new.liquidity_hints.penalty(
+            node('a'), node('b'), channel(43), amount_msat=500_000, policy=(1000, 100, 40)))
+        new.import_saved_liquidity_hints(None)  # nothing saved yet
+        new.import_saved_liquidity_hints('')
+        self.assertTrue(self._cannot_send(new, 42))
+        new.reset_liquidity_hints()
+        self.assertFalse(self._cannot_send(new, 42))
 
     async def test_old_failure_is_known_to_the_next_session(self):
         a, b = node('a'), node('b')
@@ -3472,131 +3424,40 @@ class Test_LNRouter(ElectrumTestCase):
         default = LiquidityHintMgr().penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy)
         start = mock_time = int(time.time())
         with mock.patch.object(lnrouter, 'now', lambda: mock_time):
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
+            path_finder = self._path_finder()
             path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-            await path_finder.save_liquidity_hints()
-            await self._end_session(cdb)
+            saved = path_finder.liquidity_hints_to_save()
             # hours later, as the app that the OS killed gets opened for the next payment
             age = 3 * HINT_DURATION
             mock_time = start + age
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
+            path_finder = self._path_finder()
+            path_finder.import_saved_liquidity_hints(saved)
             hints = path_finder.liquidity_hints
-            self.assertEqual(default, hints.penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy))
-            self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=b, invoice_amount_msat=1_000_000))
             for number in (42, 49):  # the channel that failed, a parallel one
                 self.assertAlmostEqual(
                     self._old_failure_penalty(default, age),
                     hints.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
             # this session saves it again, as old as it is
             path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
-            await path_finder.save_liquidity_hints()
-            await self._end_session(cdb)
+            saved = path_finder.liquidity_hints_to_save()
             age = 5 * HINT_DURATION
             mock_time = start + age
-            self.cdb, path_finder, loaded = self._new_session()
-            await loaded
-            self.assertIsNone(path_finder.find_path_for_payment(nodeA=node('s'), nodeB=b, invoice_amount_msat=1_000_000))
+            path_finder = self._path_finder()
+            path_finder.import_saved_liquidity_hints(saved)
             self.assertAlmostEqual(
                 self._old_failure_penalty(default, age),
                 path_finder.liquidity_hints.penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy), delta=0.001)
 
-    async def test_liquidity_hints_of_earlier_sessions_are_taken_over_before_an_htlc_result_is_recorded(self):
-        cdb, path_finder, loaded = self._new_session()
-        await loaded
-        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-        await path_finder.save_liquidity_hints()
-        await self._end_session(cdb)
-        self.cdb, path_finder, loaded = self._new_session()
-        await loaded
-        # the first thing this session does with the path finder. the failures of node pairs are only
-        # taken over as long as we have not learned anything ourselves
-        seen = []
-        import_state = path_finder.liquidity_hints.import_state
-        def spy(state):
-            seen.append((path_finder._saved_liquidity_hints_loaded, path_finder._saved_liquidity_hints_lock.locked()))
-            return import_state(state)
-        path_finder.liquidity_hints.import_state = spy
-        path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
-        self.assertEqual({(node('a'), node('b'))}, set(path_finder.liquidity_hints._pair_cannot_send))
-        # nobody could save hints that lack those of earlier sessions while these were being taken over
-        self.assertEqual([(False, True)], seen)
-        self.assertTrue(path_finder._saved_liquidity_hints_loaded)
-
-    async def test_liquidity_hints_that_cannot_be_saved_do_not_break_anything(self):
-        self.cdb, path_finder, loaded = self._new_session()
-        await loaded
-        self.assertIs(True, await path_finder.save_liquidity_hints())
-        other = sqlite3.connect(self.cdb.path)
-        other.execute("DROP TABLE path_finder_state")
-        other.commit()
-        other.close()
-        with self.assertLogs('electrum', level='WARNING') as logs:
-            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-            self.assertIs(False, await path_finder.save_liquidity_hints())
-        self.assertIn('could not save the liquidity hints', '\n'.join(logs.output))
-        self.assertTrue(self._cannot_send(path_finder, 42))
-        await self.cdb.save_synced_until(1)  # the db goes on working
-
-    async def test_reset_liquidity_hints_also_forgets_those_of_earlier_sessions(self):
-        for use_before_reset, use_after_reset in ((True, True), (False, True), (True, False), (False, False)):
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
-            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
-            await path_finder.save_liquidity_hints()
-            await self._end_session(cdb)
-
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
-            if use_before_reset:
-                path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000, failing_channel=channel(43))
-                self.assertTrue(self._cannot_send(path_finder, 42))
-            await path_finder.reset_liquidity_hints()
-            self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
-            if not use_after_reset:  # the reset by itself is on disk
-                await self._end_session(cdb)
-                cdb, path_finder, loaded = self._new_session()
-                await loaded
-                self.assertIsNone(path_finder.find_path_for_payment(
-                    nodeA=node('s'), nodeB=node('b'), invoice_amount_msat=1_000_000))
-                self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
-                await self._end_session(cdb)
-                continue
-            path_finder.update_liquidity_hints(self._liquidity_route(44), 1_000_000)  # they do not come back
-            self.assertFalse(self._cannot_send(path_finder, 42))
-            await path_finder.save_liquidity_hints()
-            await self._end_session(cdb)
-
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
-            path_finder.update_liquidity_hints(self._liquidity_route(45), 1_000_000)
-            self.assertEqual([False, False], [self._cannot_send(path_finder, number) for number in (42, 43)])
-            await path_finder.reset_liquidity_hints()
-            await self._end_session(cdb)
-
-    async def test_saved_liquidity_hints_that_cannot_be_read_are_ignored_and_replaced(self):
-        for garbage in ('not json', '{"version": 99}', '[]'):
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
-            await cdb.save_liquidity_hints(garbage)
-            await self._end_session(cdb)
-
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
+    async def test_saved_liquidity_hints_that_cannot_be_read_are_ignored(self):
+        for garbage in ('not json', '{"version": 99}', '[]', '{}'):
+            path_finder = self._path_finder()
             with self.assertLogs('electrum', level='WARNING') as logs:
-                path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+                path_finder.import_saved_liquidity_hints(garbage)
             self.assertIn('could not load the liquidity hints', '\n'.join(logs.output))
+            # it goes on working, and what it learns can be saved
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
             self.assertTrue(self._cannot_send(path_finder, 42))
-            await path_finder.save_liquidity_hints()
-            await self._end_session(cdb)
-
-            cdb, path_finder, loaded = self._new_session()
-            await loaded
-            path_finder.update_liquidity_hints(self._liquidity_route(43), 1_000_000)
-            self.assertTrue(self._cannot_send(path_finder, 42))
-            await path_finder.reset_liquidity_hints()
-            await self._end_session(cdb)
+            self.assertIn(channel(42).hex(), json.loads(path_finder.liquidity_hints_to_save())['channels'])
 
     def test_reset_liquidity_hints_clears_inflight_htlcs(self):
         liquidity_hints = LiquidityHintMgr()

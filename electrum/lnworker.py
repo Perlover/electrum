@@ -85,7 +85,7 @@ from .lnonion import (
 from .lnmsg import decode_msg
 from .lnrouter import (
     RouteEdge, LNPaymentRoute, LNPaymentPath, is_route_within_budget, NoChannelPolicy,
-    LNPathInconsistent, fee_for_edge_msat, local_scid_for_route_hint,
+    LNPathInconsistent, fee_for_edge_msat, local_scid_for_route_hint, LNPathFinder,
 )
 from .lnwatcher import LNWatcher
 from .submarine_swaps import SwapManager
@@ -1587,6 +1587,7 @@ class LNWallet(Logger):
         self.wallet = wallet
         self.config = wallet.config
         self.db = wallet.db
+        self._path_finder_with_our_hints = None  # type: Optional[LNPathFinder]  # see _path_finder()
         self.instantiation_timestamp = int(time.time())
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
@@ -2607,6 +2608,27 @@ class LNWallet(Logger):
         log = self.logs[key]
         return success, log
 
+    # What the path finder learned about the liquidity of channels from our payments, as liquidity_hints_to_save()
+    # returns it. It tells when we paid, and how much, so it is kept in the wallet file, which can be encrypted.
+    LIQUIDITY_HINTS_DB_KEY = 'lightning_liquidity_hints'
+
+    def _path_finder(self) -> Optional[LNPathFinder]:
+        """The path finder of the network, with the liquidity hints we saved taken over: the first time we
+        use it, which is before it is used for our payments, also after a restart of the gossip."""
+        path_finder = self.network.path_finder if self.network else None
+        if path_finder is not None and path_finder is not self._path_finder_with_our_hints:
+            self._path_finder_with_our_hints = path_finder
+            path_finder.import_saved_liquidity_hints(self.db.get(self.LIQUIDITY_HINTS_DB_KEY))
+        return path_finder
+
+    def _save_liquidity_hints(self, path_finder: LNPathFinder) -> None:
+        # written to disk with the state of the channel, which changes with the result of an htlc
+        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, path_finder.liquidity_hints_to_save())
+
+    def forget_saved_liquidity_hints(self) -> None:
+        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, None)
+        self.wallet.save_db()
+
     WAIT_FOR_CHAIN_TIP_TIMEOUT = 15  # seconds
 
     async def _wait_for_chain_tip(self) -> None:
@@ -2893,7 +2915,8 @@ class LNWallet(Logger):
     ) -> None:
 
         assert self.channel_db  # cannot be in trampoline mode
-        assert self.network.path_finder
+        path_finder = self._path_finder()
+        assert path_finder
 
         code, data = failure_msg.code, failure_msg.data
         # TODO can we use lnmsg.OnionWireSerializer here?
@@ -2914,7 +2937,7 @@ class LNWallet(Logger):
         except IndexError:
             raise PaymentFailure(f'payment destination reported error: {failure_msg.code_name()}') from None
         # the nodes up to the one that returned the error are online
-        self.network.path_finder.report_nodes_online([edge.start_node for edge in route[1:sender_idx + 2]])
+        path_finder.report_nodes_online([edge.start_node for edge in route[1:sender_idx + 2]])
 
         # handle failure codes that may include a channel update
         if code in failure_codes:
@@ -2942,14 +2965,15 @@ class LNWallet(Logger):
             # we interpret a temporary channel failure as a liquidity issue
             # in the channel and update our liquidity hints accordingly
             if code == OnionFailureCode.TEMPORARY_CHANNEL_FAILURE:
-                self.network.path_finder.update_liquidity_hints(
+                path_finder.update_liquidity_hints(
                     route,
                     amount_msat,
                     failing_channel=ShortChannelID(failing_channel))
+                self._save_liquidity_hints(path_finder)
             # the node likely changed the fee or cltv delta of its parallel channels to the same node too
             if code in (OnionFailureCode.FEE_INSUFFICIENT, OnionFailureCode.INCORRECT_CLTV_EXPIRY) and not blacklist:
                 edge = route[sender_idx + 1]
-                self.network.path_finder.liquidity_hints.update_outdated_policy(
+                path_finder.liquidity_hints.update_outdated_policy(
                     edge.start_node, edge.end_node,
                     policy=(edge.fee_base_msat, edge.fee_proportional_millionths, edge.cltv_delta))
         # for errors that never include a channel update
@@ -2960,9 +2984,9 @@ class LNWallet(Logger):
                     and self.lnpeermgr.get_peer_by_pubkey(next_node) is None):
                 # if several nodes cannot forward to the next node, it is likely offline
                 # (but not if it is us, or we are connected to it)
-                self.network.path_finder.report_unknown_next_peer(route[sender_idx + 1].start_node, next_node)
+                path_finder.report_unknown_next_peer(route[sender_idx + 1].start_node, next_node)
         if blacklist:
-            self.network.path_finder.add_edge_to_blacklist(short_channel_id=failing_channel)
+            path_finder.add_edge_to_blacklist(short_channel_id=failing_channel)
 
     def _handle_chanupd_from_failed_htlc(
         self, payload, *,
@@ -3274,7 +3298,7 @@ class LNWallet(Logger):
                     # already selected as inflight, or all parts would take the same path.
                     # (the real accounting happens in pay_to_route, so this is undone below)
                     counted_inflight_routes = []
-                    path_finder = self.network.path_finder
+                    path_finder = self._path_finder()
                     # each part gets its share of the budget
                     part_budget = budget._replace(fee_msat=budget.fee_msat // sc.config.number_parts())
                     try:
@@ -4024,9 +4048,10 @@ class LNWallet(Logger):
         shi = self.sent_htlcs_info.get((payment_hash, chan.short_channel_id, htlc_id))
         if shi and htlc_id in chan.onion_keys:
             chan.pop_onion_key(htlc_id)
-            if self.network.path_finder:
-                self.network.path_finder.update_liquidity_hints(shi.route, shi.amount_receiver_msat)
-                self.network.path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=False)
+            if path_finder := self._path_finder():
+                path_finder.update_liquidity_hints(shi.route, shi.amount_receiver_msat)
+                path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=False)
+                self._save_liquidity_hints(path_finder)
             payment_key = payment_hash + shi.payment_secret_orig
             paysession = self._paysessions[payment_key]
             q = paysession.sent_htlcs_q

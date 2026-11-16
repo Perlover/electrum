@@ -23,7 +23,6 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import asyncio
 import json
 import queue
 from collections import defaultdict
@@ -858,44 +857,25 @@ class LNPathFinder(Logger):
         # not changed, as path finding reads them without the lock.
         self._unknown_next_peer_reports = dict()  # type: Dict[bytes, Dict[bytes, int]]
         self._blacklist_lock = threading.Lock()
-        # The liquidity hints are kept in the db, for the next session: on mobile, the OS kills us soon after
-        # the user leaves, and a payment made minutes later would run into the same depleted channels again.
-        self._saved_liquidity_hints_loaded = False
-        self._saved_liquidity_hints_lock = threading.Lock()
 
-    def _load_saved_liquidity_hints(self) -> None:
-        """Takes over the liquidity hints an earlier session saved, once the db has them loaded."""
-        if self._saved_liquidity_hints_loaded or not self.channel_db.data_loaded.is_set():
+    def import_saved_liquidity_hints(self, data: Optional[str]) -> None:
+        """Takes over liquidity hints that liquidity_hints_to_save() returned in an earlier session. Our wallets
+        keep them: on mobile, the OS kills us soon after the user leaves, and a payment made minutes later
+        would run into the same depleted channels again."""
+        if not data:
             return
-        # Whoever else comes here meanwhile waits until they are taken over: a save before that
-        # would overwrite them, with hints that lack them.
-        with self._saved_liquidity_hints_lock:
-            if self._saved_liquidity_hints_loaded:
-                return
-            try:
-                data = self.channel_db.liquidity_hints_at_load
-                if data:
-                    num_imported = self.liquidity_hints.import_state(json.loads(data))
-                    self.logger.info(f"loaded {num_imported} liquidity hints of earlier sessions")
-            except Exception as e:
-                self.logger.warning(f"could not load the liquidity hints of earlier sessions: {e!r}")
-            finally:
-                self._saved_liquidity_hints_loaded = True
+        try:
+            num_imported = self.liquidity_hints.import_state(json.loads(data))
+        except Exception as e:
+            self.logger.warning(f"could not load the liquidity hints of earlier sessions: {e!r}")
+        else:
+            self.logger.info(f"loaded {num_imported} liquidity hints of earlier sessions")
 
-    def save_liquidity_hints(self) -> Optional[asyncio.Future]:
-        """Keeps the liquidity hints for the next session. Returns what to await to know they are on disk."""
-        self._load_saved_liquidity_hints()
-        if not self._saved_liquidity_hints_loaded:
-            return None  # not to overwrite those of earlier sessions, which the db has not loaded yet
-        data = json.dumps(self.liquidity_hints.export_state(), separators=(',', ':'))
-        return self.channel_db.save_liquidity_hints(data)
+    def liquidity_hints_to_save(self) -> str:
+        return json.dumps(self.liquidity_hints.export_state(), separators=(',', ':'))
 
-    def reset_liquidity_hints(self) -> Optional[asyncio.Future]:
-        """Forgets the liquidity hints, also those of earlier sessions."""
-        with self._saved_liquidity_hints_lock:
-            self._saved_liquidity_hints_loaded = True
+    def reset_liquidity_hints(self) -> None:
         self.liquidity_hints.reset_liquidity_hints()
-        return self.save_liquidity_hints()
 
     def _is_edge_blacklisted(self, short_channel_id: ShortChannelID, *, now: int) -> bool:
         blacklist_expiration = self._edge_blacklist.get(short_channel_id)
@@ -966,7 +946,6 @@ class LNPathFinder(Logger):
         note: actual routable amounts are slightly different than reported here
               as fees would need to be added.
         """
-        self._load_saved_liquidity_hints()
         # the nodes that forwarded the htlc, or returned the error, are online
         online = []
         for r in route:
@@ -988,7 +967,6 @@ class LNPathFinder(Logger):
                 break
         else:
             assert failing_channel is None
-        self.save_liquidity_hints()
 
     def update_num_inflight_htlcs(self, route: LNPaymentRoute, *, add_htlcs: bool) -> None:
         self.logger.info(f"{'Adding' if add_htlcs else 'Removing'} inflight htlcs to graph (liquidity hints).")
@@ -1230,7 +1208,6 @@ class LNPathFinder(Logger):
         assert type(invoice_amount_msat) is int or invoice_amount_msat is None
         if my_sending_channels is None:
             my_sending_channels = {}
-        self._load_saved_liquidity_hints()
 
         previous_hops = self.get_shortest_path_hops(
             nodeA=nodeA,

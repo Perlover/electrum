@@ -913,6 +913,12 @@ class TestCommandsTestnet(ElectrumTestCase):
         network.path_finder.reset_liquidity_hints.assert_called_once_with()
         network.path_finder.liquidity_hints.reset_liquidity_hints.assert_not_called()
         network.path_finder.clear_blacklist.assert_called_once_with()
+        # and the wallets forget those they keep for the next session
+        daemon = mock.Mock()
+        with_lightning, without_lightning = mock.Mock(), mock.Mock(lnworker=None)
+        daemon.get_wallets.return_value = {'a': with_lightning, 'b': without_lightning}
+        await Commands(config=self.config, network=network, daemon=daemon).reset_liquidity_hints()
+        with_lightning.lnworker.forget_saved_liquidity_hints.assert_called_once_with()
 
     @staticmethod
     def _mock_channel(*, is_backup: bool, can_be_deleted: bool) -> mock.Mock:

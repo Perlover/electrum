@@ -13,7 +13,7 @@ import pathlib
 import os
 import platform
 import re
-from typing import Optional, TYPE_CHECKING, Set, Iterable, List
+from typing import Optional, TYPE_CHECKING, Set, Iterable, List, Callable
 import copy
 import subprocess
 import hashlib
@@ -345,12 +345,16 @@ def configure_logging(config: 'SimpleConfig', *, log_to_file: Optional[bool] = N
         root_logger.removeHandler(_inmemory_startup_logs)
         _inmemory_startup_logs = None
 
+    _log_versions()
+    _logger.info(f"Logging to file: {str(_logfile_path)}")
+    _logger.info(f"Log filters: verbosity {repr(verbosity)}")
+
+
+def _log_versions() -> None:
     from . import ELECTRUM_VERSION
     from .constants import GIT_REPO_URL
     _logger.info(f"Electrum version: {ELECTRUM_VERSION} - https://electrum.org - {GIT_REPO_URL}")
     _logger.info(f"Python version: {sys.version}. On platform: {describe_os_version()}")
-    _logger.info(f"Logging to file: {str(_logfile_path)}")
-    _logger.info(f"Log filters: verbosity {repr(verbosity)}")
 
 
 def get_logfile_path() -> Optional[pathlib.Path]:
@@ -367,6 +371,7 @@ def set_file_logging(config: 'SimpleConfig', enabled: bool) -> None:
             num_files_keep=config.LOGS_NUM_FILES_KEEP,
             max_total_size=config.LOGS_MAX_TOTAL_SIZE_BYTES)
         _logger.info(f"Logging to file: {str(_logfile_path)}")
+        _log_versions()  # (at the start of each log file)
     elif not enabled and _file_handler is not None and not is_android_debug_apk():
         _logger.info("Logging to file stops")
         root_logger.removeHandler(_file_handler)
@@ -457,10 +462,12 @@ class _LogRedactor:
         ('ip', re.compile(r'(?<![\w.:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?::'
                           r'(?:(?:[0-9a-fA-F]{1,4}:)*(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{1,4}))?(?![\w:.])'), 0),
         ('ip', re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)(?!\w)'), 0),
-        ('host', re.compile(r'@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d'), 1),  # of a peer: node_id@host:port
+        ('host', re.compile(r'@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*):\d'), 1),  # of a peer: node_id@host:port
+        ('host', re.compile(r'failed to connect ([^\s<]+) '), 1),
         ('server', re.compile(r'interface\.\[([^\]]+)\]'), 1),
         ('payment', re.compile(r'PaySession\.\[([0-9a-f]{8}-[0-9a-f]{4})\]'), 1),
     )
+    _LABEL = re.compile(r'(<(?:our )?[a-z]+ [0-9a-f]{8}>)')
     _CHANNELS_WITH_FUNDS = re.compile(r'channels_with_funds: \{.*?\}(?=, have_direct_channel|$)', re.M)
     # where the logs name a wallet, and what a wallet logs about its own payments
     _WALLET_NAMES = (
@@ -520,16 +527,13 @@ class _LogRedactor:
         for m in self._OUR_FIRST_HOP.finditer(text):
             self._our_nodes.add(m.group(1))
             self._our_channels.add(m.group(2))
-        wallet_names = set(self._wallet_names)
-        for pattern in self._WALLET_NAMES:
-            wallet_names.update(name for m in pattern.finditer(text) if len(name := m.group(1)) >= 3)
+        # (names in logger names, any of them; elsewhere, those long enough not to be found in other words)
+        names_in_logger_names = {
+            name for pattern in self._WALLET_NAMES for m in pattern.finditer(text)
+            if not (name := m.group(1)).startswith('<')}
+        wallet_names = {name for name in names_in_logger_names | self._wallet_names if len(name) >= 3}
         if self._home:
             text = text.replace(self._home, '~')
-        if wallet_names:
-            pattern = re.compile(
-                r'(?<![0-9A-Za-z])(?:' + '|'.join(re.escape(v) for v in sorted(wallet_names, key=len, reverse=True))
-                + r')(?![0-9A-Za-z])')
-            text = pattern.sub(lambda m: self._label('wallet', m.group(0)), text)
         text = self._CHANNELS_WITH_FUNDS.sub('channels_with_funds: <balances>', text)
         text = self._BYTES.sub(lambda m: self._label_of_bytes(m.group(0)), text)
         for kind, pattern, group in self._RULES:
@@ -545,6 +549,23 @@ class _LogRedactor:
                 start, end = m.span(group)
                 return m.group(0)[:start - m.start()] + new + m.group(0)[end - m.start():]
             text = pattern.sub(replace, text)
+        # the names of wallets last, as they may be anything (e.g. a number that is part of an ip address),
+        # and not within the labels
+        def outside_labels(replace: Callable[[str], str], text: str) -> str:
+            return ''.join(part if i % 2 else replace(part) for i, part in enumerate(self._LABEL.split(text)))
+
+        def in_logger_name(m: re.Match) -> str:
+            if m.group(1) not in names_in_logger_names:
+                return m.group(0)
+            start, end = m.start(1) - m.start(), m.end(1) - m.start()
+            return m.group(0)[:start] + self._label('wallet', m.group(1)) + m.group(0)[end:]
+        for pattern in self._WALLET_NAMES:
+            text = outside_labels(lambda part, pattern=pattern: pattern.sub(in_logger_name, part), text)
+        if wallet_names:
+            names = re.compile(
+                r'(?<![0-9A-Za-z])(?:' + '|'.join(re.escape(v) for v in sorted(wallet_names, key=len, reverse=True))
+                + r')(?![0-9A-Za-z])')
+            text = outside_labels(lambda part: names.sub(lambda m: self._label('wallet', m.group(0)), part), text)
         return text
 
 

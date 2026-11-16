@@ -110,6 +110,10 @@ class TestRedactLogText(ElectrumTestCase):
             # a peer, with a host name the user may have typed
             (f'handshake done for {self.NODE_ID}@myhome.duckdns.org:9735',
              f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "myhome.duckdns.org")}:9735'),
+            (f'handshake done for {self.NODE_ID}@mynode:9735',
+             f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "mynode")}:9735'),
+            ('failed to connect node.example.com [Errno -2] Name or service not known',
+             f'failed to connect {label("host", "node.example.com")} [Errno -2] Name or service not known'),
             ('catching up on gossip. peers (msgs/s, old updates): 03abcd 12 300 done, 02ef01 ? 0. unknown_ids=3',
              f'catching up on gossip. peers (msgs/s, old updates): {label("node", "03abcd")} 12 300 done, {label("node", "02ef01")} ? 0. '
              'unknown_ids=3'),
@@ -179,6 +183,24 @@ class TestRedactLogText(ElectrumTestCase):
                     f"[('{label('node', '0322222222')}', '{label('channel', '16000000x1x2', 'our channel')}', 1000, 1, 144)])]")
             + _line(f'lnpeer.Peer.[LNGossip, {label("node", "0322222222")}-1a2b3c4d]', f'query {label("channel", "700000x1x1")}'),
             redact(text))
+
+    def test_wallet_names_whatever_they_are(self):
+        text = (_line('lnworker.LNWallet.[AK]', 'paying AK from AK; peer 192.168.1.100 and node@myhome.example:9735')
+                + _line('lnpeer.Peer.[AK, 0322222222-1a2b3c4d]', 'Received INIT'))
+        ak = label('wallet', 'AK')
+        expected = (_line(f'lnworker.LNWallet.[{ak}]', f'paying AK from AK; peer {label("ip", "192.168.1.100")} and '
+                          f'node@{label("host", "myhome.example")}:9735')
+                    + _line(f'lnpeer.Peer.[{ak}, {label("node", "0322222222")}-1a2b3c4d]', 'Received INIT'))
+        # (a short name only in logger names, where it is a name for sure)
+        self.assertEqual(expected, redact(text))
+        self.assertEqual(redact(text), redact(redact(text)))
+        # names that are numbers, or words of the labels, do not break the labels
+        odd = redact(text, wallet_names=['100', '9735', 'node', 'host', 'our', 'wallet'])
+        self.assertIn(label('ip', '192.168.1.100'), odd)
+        self.assertIn(label('host', 'myhome.example'), odd)
+        self.assertIn(f'lnworker.LNWallet.[{ak}]', odd)
+        self.assertNotRegex(odd, r'<[^<>]*<')  # no label within a label
+        self.assertEqual(odd, redact(odd, wallet_names=['100', '9735', 'node', 'host', 'our', 'wallet']))
 
     def test_home_directory_is_replaced(self):
         home = os.path.expanduser('~')
@@ -280,6 +302,7 @@ class TestSetFileLogging(ElectrumTestCase):
         self.assertEqual(pathlib.Path(self.config.path) / 'logs', path.parent)
         logger = electrum_logging.get_logger('test_file_logging')
         logger.warning('written to the file')
+        self.assertIn('Electrum version', path.read_text(encoding='utf-8'))  # (what the developers want to know)
         set_file_logging(self.config, True)  # again: nothing changes
         self.assertEqual(path, electrum_logging.get_logfile_path())
         set_file_logging(self.config, False)

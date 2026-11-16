@@ -228,6 +228,7 @@ class TestPeer(ElectrumTestCase):
                           'wallet_names': [workers[0].wallet.basename()]}):
             shared = redact_log_text(kept, key=bytes(32), **ours)
             self.assertIn('sent htlc', shared)  # what it is for is kept
+            self.assertEqual(shared, redact_log_text(shared, key=bytes(32), **ours))  # labels are left as they are
             for name, secret in secrets.items():
                 forms = [secret.hex(), repr(secret)[2:-1], base64.b64encode(secret).decode()]
                 forms += [secret.hex()[:16], secret.hex()[:10]] if len(secret) >= 20 else []

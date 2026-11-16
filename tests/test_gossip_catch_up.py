@@ -273,6 +273,9 @@ class TestGossipCatchUp(ElectrumTestCase):
         for name in ('GossipSyncJobService', 'GossipSyncService'):
             self.assertIn(f'android:name="org.electrum.gossip.{name}"', hook)
             self.assertTrue(os.path.exists(os.path.join(java_dir, name + '.java')))
+        # the job runs about every interval: with a flex, see GossipSyncJobService.schedule
+        self.assertIn('.setPeriodic(intervalMillis, flexMillis)', job_service)
+        self.assertIn('long flexMillis = Math.max(intervalMillis / 4, JobInfo.getMinFlexMillis());', job_service)
         # what python calls on the job service
         for signature in ('boolean isIgnoringBatteryOptimizations(Context context)',
                           'boolean requestIgnoreBatteryOptimizations(Context context)'):

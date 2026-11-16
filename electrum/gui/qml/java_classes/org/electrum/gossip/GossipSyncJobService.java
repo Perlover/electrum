@@ -39,6 +39,7 @@ public class GossipSyncJobService extends JobService {
 
     private static final String EXTRA_APK_UPDATE_TIME = "apk_update_time";
     private static final String EXTRA_INTERVAL_MINUTES = "interval_minutes";
+    private static final String EXTRA_FLEX_MILLIS = "flex_millis";
     private static final String EXTRA_UNMETERED_ONLY = "unmetered_only";
     private static final String EXTRA_CHARGING_ONLY = "charging_only";
 
@@ -65,11 +66,18 @@ public class GossipSyncJobService extends JobService {
     public static boolean schedule(Context context, long intervalMinutes, boolean unmeteredOnly, boolean chargingOnly) {
         JobScheduler scheduler = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
         long apkUpdateTime = getApkUpdateTime(context);
+        long intervalMillis = intervalMinutes * 60 * 1000;
+        // The OS runs the job at some time within the last flexMillis of each interval. Without a flex
+        // it is the whole interval: the job can then run twice in a row, at the end of an interval and at
+        // the start of the next, or not for almost two intervals, and after a run that the OS deferred
+        // past its interval (doze, no wifi) the next one is due at once.
+        long flexMillis = Math.max(intervalMillis / 4, JobInfo.getMinFlexMillis());
         JobInfo pending = scheduler.getPendingJob(JOB_ID);
         if (pending != null) {
             PersistableBundle extras = pending.getExtras();
             if (extras.getLong(EXTRA_APK_UPDATE_TIME, -1) == apkUpdateTime
                     && extras.getLong(EXTRA_INTERVAL_MINUTES, -1) == intervalMinutes
+                    && extras.getLong(EXTRA_FLEX_MILLIS, -1) == flexMillis
                     && extras.getInt(EXTRA_UNMETERED_ONLY, -1) == (unmeteredOnly ? 1 : 0)
                     && extras.getInt(EXTRA_CHARGING_ONLY, -1) == (chargingOnly ? 1 : 0)) {
                 return true;  // scheduling again would restart the interval, every time the app starts
@@ -78,10 +86,11 @@ public class GossipSyncJobService extends JobService {
         PersistableBundle extras = new PersistableBundle();
         extras.putLong(EXTRA_APK_UPDATE_TIME, apkUpdateTime);
         extras.putLong(EXTRA_INTERVAL_MINUTES, intervalMinutes);
+        extras.putLong(EXTRA_FLEX_MILLIS, flexMillis);
         extras.putInt(EXTRA_UNMETERED_ONLY, unmeteredOnly ? 1 : 0);
         extras.putInt(EXTRA_CHARGING_ONLY, chargingOnly ? 1 : 0);
         JobInfo.Builder builder = new JobInfo.Builder(JOB_ID, new ComponentName(context, GossipSyncJobService.class))
-                .setPeriodic(intervalMinutes * 60 * 1000)
+                .setPeriodic(intervalMillis, flexMillis)
                 .setRequiredNetworkType(unmeteredOnly ? JobInfo.NETWORK_TYPE_UNMETERED : JobInfo.NETWORK_TYPE_ANY)
                 .setRequiresCharging(chargingOnly)
                 .setRequiresBatteryNotLow(true)

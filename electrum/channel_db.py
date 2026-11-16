@@ -649,6 +649,8 @@ class ChannelDB(SqlDB):
         c.execute(create_channel_info)
         c.execute(create_orphaned_channel)
         c.execute(create_meta)
+        # test builds of 2026-11-15 kept the liquidity hints in this table; they are in the wallet file now
+        c.execute("DROP TABLE IF EXISTS path_finder_state")
         self.conn.commit()
 
     @sql

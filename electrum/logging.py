@@ -4,6 +4,7 @@
 
 import ast
 import hmac
+import ipaddress
 import logging
 import logging.handlers
 import datetime
@@ -450,7 +451,7 @@ class _LogRedactor:
         ('address', re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), 0),
         ('onion', re.compile(r'\b[a-z2-7]{56}\.onion\b', re.I), 0),
         ('channel in hex', re.compile(r'(?<![0-9a-fA-F])([0-9a-f]{16}):\d'), 1),  # the key of an htlc
-        ('host', re.compile(r'@([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*):\d'), 1),  # of a peer: node_id@host:port
+        ('host', re.compile(r'@([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?):\d'), 1),  # of a peer: node_id@host:port
         ('host', re.compile(r'failed to connect ([^\s<]+) '), 1),
         ('node', re.compile(r'(?<![0-9a-fA-F])0[23][0-9a-fA-F]{64}(?![0-9a-fA-F])'), 0),
         # 20 bytes or more in hex: hashes, secrets, txids, channel ids, scripts, transactions
@@ -471,8 +472,11 @@ class _LogRedactor:
     _CHANNELS_WITH_FUNDS = re.compile(r'channels_with_funds: \{.*?\}(?=, have_direct_channel|$)', re.M)
     # where the logs name a wallet, and what a wallet logs about its own payments
     _WALLET_NAMES = (
-        re.compile(r'(?:LNWallet|LNPeerManager)\.\[(?!LNGossip\])(.+?)\](?= \||\Z)'),
-        re.compile(r'Peer\.\[(?!LNGossip,)(.+?), (?=[^,\]\n]*\] \||\Z)'),  # (up to the name of the transport)
+        # (in the head of the entries only, as the messages may be anything a peer sent; names of a sane length)
+        re.compile(r'^\d{8}T\d{6}\.\d+Z \|\s*\w+ \| lnworker\.(?:LNWallet|LNPeerManager)\.\[(?!LNGossip\])'
+                   r'(.{1,255}?)\](?= \||\Z)', re.M),
+        re.compile(r'^\d{8}T\d{6}\.\d+Z \|\s*\w+ \| lnpeer\.Peer\.\[(?!LNGossip,)'
+                   r'(.{1,255}?), (?=[^,\]\n]*\] \||\Z)', re.M),  # (up to the name of the transport)
     )
     _WALLET_PATH = re.compile(r'/wallets/([^/\s\'"]+)')
     _OUR_CHANNEL = re.compile(r'sent htlc \d+ over ([0-9]+x[0-9]+x[0-9]+)')
@@ -504,6 +508,14 @@ class _LogRedactor:
         elif kind == 'channel' and value in self._our_channels:
             kind = 'our channel'
         return f'<{kind} {digest}>'
+
+    @staticmethod
+    def _is_ip(value: str) -> bool:
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return False
+        return True
 
     def _label_of_bytes(self, literal: str) -> str:
         try:
@@ -544,6 +556,8 @@ class _LogRedactor:
                     value = bytes.fromhex(m.group(group))
                     new = self._label('channel', '{}x{}x{}'.format(
                         int.from_bytes(value[:3], 'big'), int.from_bytes(value[3:6], 'big'), int.from_bytes(value[6:], 'big')))
+                elif kind == 'host' and self._is_ip(m.group(group)):
+                    new = self._label('ip', m.group(group))  # (the same label as where the ip is logged otherwise)
                 else:
                     new = self._label(kind, m.group(group))
                 start, end = m.span(group)

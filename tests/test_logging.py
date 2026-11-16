@@ -114,6 +114,13 @@ class TestRedactLogText(ElectrumTestCase):
              f'adding peer {label("node", self.NODE_ID[:10])}@{label("host", "my_node.lan")}:9735'),
             (f'handshake done for {self.NODE_ID}@mynode:9735',
              f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "mynode")}:9735'),
+            ('failed to connect lnd-700000x1x2.example.com TimeoutError()',
+             f'failed to connect {label("host", "lnd-700000x1x2.example.com")} TimeoutError()'),
+            (f'adding peer {self.NODE_ID}@203.0.113.7:9735 and later 203.0.113.7, failed to connect 2001:db8::1 x',
+             f'adding peer {label("node", self.NODE_ID[:10])}@{label("ip", "203.0.113.7")}:9735 and later '
+             f'{label("ip", "203.0.113.7")}, failed to connect {label("ip", "2001:db8::1")} x'),
+            (f'handshake done for {self.NODE_ID}@myhome.example.:9735',
+             f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "myhome.example.")}:9735'),
             ('failed to connect node.example.com [Errno -2] Name or service not known',
              f'failed to connect {label("host", "node.example.com")} [Errno -2] Name or service not known'),
             ('catching up on gossip. peers (msgs/s, old updates): 03abcd 12 300 done, 02ef01 ? 0. unknown_ids=3',
@@ -207,7 +214,7 @@ class TestRedactLogText(ElectrumTestCase):
         self.assertEqual(odd, redact(odd, wallet_names=['100', '9735', 'node', 'host', 'our', 'wallet']))
 
     def test_wallet_names_with_commas_spaces_and_other_letters(self):
-        for name in ('Alexey, savings', 'Лена, личный', '<w>', 'my savings'):
+        for name in ('Alexey, savings', 'Лена, личный', '<w>', 'my savings', 'ab]cd'):
             with self.subTest(name=name):
                 text = (_line(f'lnworker.LNWallet.[{name}]', 'x')
                         + _line(f'lnpeer.Peer.[{name}, 0322222222-1a2b3c4d]', 'y')
@@ -221,6 +228,17 @@ class TestRedactLogText(ElectrumTestCase):
                 # also where only the lines of its peers name it
                 peer_line = _line(f'lnpeer.Peer.[{name}, 0322222222-1a2b3c4d]', 'y')
                 self.assertEqual(expected.splitlines(keepends=True)[1], redact(peer_line))
+
+    def test_what_a_peer_sends_does_not_teach_names_nor_take_long(self):
+        import time
+        # e.g. the text of a warning, which is logged in full
+        text = (_line('lnpeer.Peer.[AK, 0322222222-1a2b3c4d]', 'warning: x lnworker.LNWallet.[LNWallet] | y '
+                      + 'Peer.[a, ' * 7000 + 'LNWallet.[a] ' * 5000)
+                + _line('lnworker.LNWallet.[AK]', 'paying'))
+        t0 = time.monotonic()
+        shared = redact(text)
+        self.assertLess(time.monotonic() - t0, 5)
+        self.assertIn(f'lnworker.LNWallet.[{label("wallet", "AK")}] | paying', shared)
 
     def test_home_directory_is_replaced(self):
         home = os.path.expanduser('~')

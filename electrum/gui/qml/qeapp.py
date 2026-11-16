@@ -17,7 +17,7 @@ import electrum
 from electrum import version, constants
 from electrum.i18n import _
 from electrum.logging import (Logger, get_logger, read_recent_logs, redact_log_text, filter_log_for_sharing,
-                              what_identifies_us_in_logs)
+                              what_identifies_us_in_logs, log_sharing_key)
 from electrum.bip21 import BITCOIN_BIP21_URI_SCHEME, LIGHTNING_URI_SCHEME
 from electrum.base_crash_reporter import BaseCrashReporter, EarlyExceptionsQueue
 from electrum.network import Network
@@ -354,6 +354,7 @@ class QEAppController(BaseCrashReporter, QObject):
         try:
             daemon = QEDaemon.instance.daemon if QEDaemon.instance else None
             ours = what_identifies_us_in_logs(daemon.get_wallets().values() if daemon else [])
+            key = log_sharing_key(self.config)
         except Exception:
             self.logger.exception('failed to collect what to remove from the logs')
             self._log_file_busy = False
@@ -363,7 +364,7 @@ class QEAppController(BaseCrashReporter, QObject):
         def task():
             try:
                 text = filter_log_for_sharing(read_recent_logs(self.config, max_size=self.MAX_SHARED_LOG_SIZE))
-                self._logFileReady.emit(redact_log_text(text, **ours), '')
+                self._logFileReady.emit(redact_log_text(text, key=key, **ours), '')
             except Exception as e:
                 self.logger.exception('failed to collect the logs')
                 self._logFileReady.emit('', repr(e))

@@ -871,6 +871,7 @@ class TestPeerDirect(TestPeer):
     async def test_log_shared_with_the_developers_has_no_secrets_of_a_payment(self):
         # what Electrum really logs during a payment (at debug level, as written to the log files)
         import base64
+        import re
         import logging
         from electrum.logging import file_formatter, filter_log_for_sharing, redact_log_text
         records = []
@@ -906,18 +907,22 @@ class TestPeerDirect(TestPeer):
         self.assertIn(repr(payment_secret)[2:-1], filter_log_for_sharing(log))
         shared = redact_log_text(
             filter_log_for_sharing(log),
+            key=bytes(32),
             our_node_ids=[alice.node_keypair.pubkey.hex()],
             our_channels=[str(chan.short_channel_id)],
             wallet_names=[alice.wallet.basename()])
         self.assertIn('sent htlc', shared)  # what it is for is kept
-        self.assertIn('<payment 1>', shared)
+        self.assertRegex(shared, r'PaySession\.\[<payment [0-9a-f]{8}>\]')
         for name, secret in secrets.items():
             for form in (secret.hex(), repr(secret)[2:-1], base64.b64encode(secret).decode(), secret.hex()[:16]):
                 self.assertNotIn(form, shared, msg=name)
         for ours in (alice.node_keypair.pubkey.hex(), alice.node_keypair.pubkey.hex()[:10],
-                     str(chan.short_channel_id), alice.wallet.basename()):
+                     str(chan.short_channel_id), alice.wallet.basename(),
+                     bob.node_keypair.pubkey.hex()[:10]):  # nor whom we pay
             self.assertNotIn(ours, shared)
-        self.assertIn(bob.node_keypair.pubkey.hex()[:10], shared)  # a public node, as far as alice knows
+        # the payment hash, logged in hex and as bytes, has one label
+        payment_hash_label = re.search(r'RHASH=(<hash [0-9a-f]{8}>)', shared).group(1)
+        self.assertIn(f'payment_hash={payment_hash_label}', shared)
 
     async def test_reject_invalid_min_final_cltv_delta(self):
         """

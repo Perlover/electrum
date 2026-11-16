@@ -991,17 +991,10 @@ class LNPathFinder(Logger):
         for r in route:
             if r.short_channel_id != failing_channel:
                 self.logger.info(f"report {r.short_channel_id} to be able to forward {amount_msat} msat")
-                self.liquidity_hints.update_can_send(
-                    r.start_node, r.end_node, r.short_channel_id, amount_msat=amount_msat,
-                    policy=(r.fee_base_msat, r.fee_proportional_millionths, r.cltv_delta))
             else:
                 self.logger.info(f"report {r.short_channel_id} to be unable to forward {amount_msat} msat")
-                self.liquidity_hints.update_cannot_send(
-                    r.start_node, r.end_node, r.short_channel_id, amount_msat=amount_msat,
-                    policy=(r.fee_base_msat, r.fee_proportional_millionths, r.cltv_delta))
                 break
-        else:
-            assert failing_channel is None
+        self.liquidity_hints.update_from_route(route, amount_msat, failing_channel=failing_channel)
 
     def update_num_inflight_htlcs(self, route: LNPaymentRoute, *, add_htlcs: bool) -> None:
         self.logger.info(f"{'Adding' if add_htlcs else 'Removing'} inflight htlcs to graph (liquidity hints).")

@@ -903,6 +903,19 @@ class TestPeerDirect(TestPeer):
                     await f()
                 self.assertEqual([height + expected], received)
 
+    async def test_lnpay_counts_the_buffer_to_the_final_cltv_delta_in_max_cltv(self):
+        graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
+        w1, w2 = graph.workers.values()
+        lnaddr, pay_req = self.prepare_invoice(w2, min_final_cltv_delta=144)
+        budgets = []
+        async def pay_invoice(invoice, *, budget=None, **kwargs):
+            budgets.append(budget)
+            return False, []
+        w1.pay_invoice = pay_invoice
+        await Commands(config=w1.config, network=w1.network).lnpay(
+            pay_req.lightning_invoice, max_cltv=288, wallet=w1.wallet)
+        self.assertEqual(288 - 144 - MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT, budgets[0].cltv)
+
     async def test_payment_waits_for_the_chain_tip_but_not_forever(self):
         graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
         w1, w2 = graph.workers.values()
@@ -4471,17 +4484,34 @@ class TestPeerForwarding(TestPeer):
         self.assertEqual({b}, set(path_finder.liquidity_hints._node_cannot_receive[d][1]))
         route_of_dave = route((d, b, bd), (b, a, ab))
         dave._update_liquidity_hints(path_finder, route_of_dave, 1_000_000)
+        def amounts(saved):  # (without the timestamps)
+            channels = {scid: [a and a[0] for a in values] for scid, values in saved['channels'].items()}
+            pairs = sorted((n1, n2, amount, policy) for n1, n2, amount, _, policy in saved['pairs'])
+            nodes = {n: {m: [f[0]] + f[2:] for m, f in failures.items()} for n, failures in saved['nodes'].items()}
+            return channels, pairs, nodes
+        def hint(*, can=(), cannot=()):  # the amounts of a channel, as saved, from (node_from, node_to, amount)
+            slots = [None] * 6
+            for i, updates in ((0, can), (1, cannot)):
+                for node_from, node_to, amount in updates:
+                    slots[i + (0 if node_from < node_to else 2)] = amount
+            return slots
+        policy = [1000, 1, 144]
         saved_by_dave = json.loads(dave.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
-        expected = LiquidityHintMgr()
-        expected.import_state(earlier.export_state())
-        expected.update_from_route(route_of_dave, 1_000_000)
-        self.assertEqual(expected.export_state(), saved_by_dave)  # all of his, and only his
-        self.assertNotIn('5000000', json.dumps(saved_by_dave))
+        # all of his, and only his: what he saved, and his forward from d over b to a. (a failure in one
+        # direction tells that the amount can be sent in the other one; d -> b knew of a larger amount already)
+        self.assertEqual((
+            {ac.hex(): hint(can=[(a, c, 7_000_000)], cannot=[(c, a, 7_000_000)]),
+             bd.hex(): hint(can=[(d, b, 8_000_000)], cannot=[(b, d, 8_000_000)]),
+             ab.hex(): hint(can=[(b, a, 1_000_000)])},
+            sorted([(c.hex(), a.hex(), 7_000_000, policy), (b.hex(), d.hex(), 8_000_000, policy)]),
+            {a.hex(): {c.hex(): [7_000_000, policy]}, d.hex(): {b.hex(): [8_000_000, policy]}},
+        ), amounts(saved_by_dave))
         saved_by_alice = json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
-        expected = LiquidityHintMgr()
-        expected.update_from_route(route_of_alice, 5_000_000, failing_channel=bd)
-        self.assertEqual(expected.export_state(), saved_by_alice)
-        self.assertNotIn(ac.hex(), saved_by_alice['channels'])
+        self.assertEqual((
+            {ab.hex(): hint(can=[(a, b, 5_000_000)]), bd.hex(): hint(can=[(d, b, 5_000_000)], cannot=[(b, d, 5_000_000)])},
+            [(b.hex(), d.hex(), 5_000_000, policy)],
+            {d.hex(): {b.hex(): [5_000_000, policy]}},
+        ), amounts(saved_by_alice))
         # after a restart of the gossip, the new path finder gets what the wallets have
         alice.network.path_finder = dave.network.path_finder = LNPathFinder(alice.network.channel_db)
         new_path_finder = dave._path_finder()
@@ -4598,6 +4628,9 @@ class TestPeerForwarding(TestPeer):
             await Commands(config=alice.config, network=alice.network, daemon=alice.network.daemon).reset_liquidity_hints()
             self.assertIsNone(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))
             self.assertEqual({}, json.loads(path_finder.liquidity_hints_to_save())['channels'])
+            # and what was forgotten does not come back with what she learns next
+            alice._update_liquidity_hints(path_finder, log[1].route, amount_to_pay)
+            self.assertNotIn(scid_cd.hex(), json.loads(alice.db.get(LNWallet.LIQUIDITY_HINTS_DB_KEY))['channels'])
 
             raise PaymentDone()
         async def f():

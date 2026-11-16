@@ -3440,8 +3440,8 @@ class Test_LNRouter(ElectrumTestCase):
         with mock.patch.object(lnrouter, 'now', lambda: start + 10):
             hints = LiquidityHintMgr()
             # later: a forwarded a larger amount to b, which received it. c forwarded a smaller one to d
-            hints.update_can_send(a, b, channel(3), amount_msat=3000, policy=policy)
-            hints.update_can_send(a, b, channel(3), amount_msat=500, policy=policy)  # (the largest one counts)
+            for amount_msat in (500, 3000, 500):  # (the largest one counts, not the first or the last)
+                hints.update_can_send(a, b, channel(3), amount_msat=amount_msat, policy=policy)
             hints.update_can_send(c, d, channel(4), amount_msat=1000, policy=policy)
             # a failure of ours does not count: it does not tell the saved failures are over
             hints.update_cannot_send(b, c, channel(5), amount_msat=1000, policy=policy)

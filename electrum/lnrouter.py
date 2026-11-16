@@ -445,8 +445,10 @@ class LiquidityHint:
         self._can_send_backward = None
 
     def __repr__(self):
-        return f"forward: can send: {self._can_send_forward}, cannot send: {self._cannot_send_forward}, htlcs: {self._inflight_htlcs_forward}\n" \
-               f"backward: can send: {self._can_send_backward}, cannot send: {self._cannot_send_backward}, htlcs: {self._inflight_htlcs_backward}\n"
+        return f"forward: can send: {self._can_send_forward}, cannot send: {self._cannot_send_forward}, " \
+               f"old failure: {self._old_cannot_send_forward}, htlcs: {self._inflight_htlcs_forward}\n" \
+               f"backward: can send: {self._can_send_backward}, cannot send: {self._cannot_send_backward}, " \
+               f"old failure: {self._old_cannot_send_backward}, htlcs: {self._inflight_htlcs_backward}\n"
 
 
 class LiquidityHintMgr:
@@ -475,14 +477,17 @@ class LiquidityHintMgr:
         # node_to -> (newest timestamp, {node_from: smallest amount that failed}). The values are replaced,
         # not changed, as penalty() reads them without the lock.
         self._node_cannot_receive: Dict[bytes, Tuple[int, Dict[bytes, LiquidAmount]]] = {}
-        # node_to -> {node_from: policy of its channel that failed, if we know it}. Only what the session
-        # saw itself: it is not kept across restarts. The values are replaced, not changed, as above.
+        # node_to -> {node_from: policy of its channel that failed, if we know it}. The values are replaced,
+        # not changed, as above.
         self._node_failed_policies: Dict[bytes, Dict[bytes, EdgePolicy]] = {}
         # Nodes often change the policies of all their channels to the same node together, so when a node
         # rejected an htlc because the fee or cltv delta we used for a channel was outdated, its parallel
         # channels to the same node that are not more expensive likely have outdated policies in our db too.
         # (node_from, node_to) -> (when, the outdated policies)
         self._pair_outdated_policy: Dict[Tuple[bytes, bytes], Tuple[LiquidAmount, Tuple[EdgePolicy, ...]]] = {}
+        # the node pairs and the nodes we learned about from htlcs since we started, see import_state()
+        self._learned_about_pairs: Set[Tuple[bytes, bytes]] = set()
+        self._learned_about_nodes: Set[bytes] = set()
 
     @with_lock
     def get_hint(self, channel_id: ShortChannelID) -> LiquidityHint:
@@ -497,6 +502,8 @@ class LiquidityHintMgr:
             self, node_from: bytes, node_to: bytes, channel_id: ShortChannelID, *,
             amount_msat: int, policy: Optional[EdgePolicy] = None,
     ) -> None:
+        self._learned_about_pairs.add((node_from, node_to))
+        self._learned_about_nodes.add(node_to)
         hint = self.get_hint(channel_id)
         hint.update_can_send(node_from < node_to, amount_msat=amount_msat)
         # a forward over a channel that is not more expensive than the one that failed
@@ -523,6 +530,8 @@ class LiquidityHintMgr:
             self, node_from: bytes, node_to: bytes, channel_id: ShortChannelID, *,
             amount_msat: int, policy: Optional[EdgePolicy] = None,
     ) -> None:
+        self._learned_about_pairs.add((node_from, node_to))
+        self._learned_about_nodes.add(node_to)
         hint = self.get_hint(channel_id)
         hint.update_cannot_send(node_from < node_to, amount_msat=amount_msat)
         _, node_failures = self._node_cannot_receive.get(node_to, (0, {}))
@@ -700,10 +709,14 @@ class LiquidityHintMgr:
         return success_fee * (1 + num_inflight_htlcs + likely_cannotsend_factor) + price_penalty_msat
 
     @with_lock
-    def export_state(self) -> dict:
+    def export_state(self, *, scids: Optional[Set[ShortChannelID]] = None, nodes: Optional[Set[bytes]] = None) -> dict:
         """What we know about the liquidity of the channels, in a form that can be saved as json,
         for import_state() of a later session. The htlcs in flight and the outdated policies
-        are not part of it: these are over, or fixed by the gossip, by then."""
+        are not part of it: these are over, or fixed by the gossip, by then.
+        If scids and nodes are given, only what is about these channels and nodes."""
+        def is_ours(scid: Optional[ShortChannelID] = None, *node_ids: bytes) -> bool:
+            return ((scids is None or scid is None or scid in scids)
+                    and (nodes is None or all(n in nodes for n in node_ids)))
         def amount(la: Optional[LiquidAmount], *, is_failure: bool = False) -> Optional[list]:
             if la is None or (la.is_forgotten() if is_failure else la.is_invalid()):
                 return None
@@ -713,30 +726,46 @@ class LiquidityHintMgr:
             pair: failed for pair, failed in self._pair_cannot_send.items() if not failed[0].is_forgotten()}
         channels = {}
         for scid, hint in self._liquidity_hints.items():
+            if not is_ours(scid):
+                continue
             amounts = [amount(getattr(hint, name), is_failure=is_failure) for name, is_failure in self._SAVED_AMOUNTS]
             if any(amounts):
                 channels[scid.hex()] = amounts
         pairs = [
             [node_from.hex(), node_to.hex(), failed.amount_msat, failed.timestamp, list(policy)]
-            for (node_from, node_to), (failed, policy) in self._pair_cannot_send.items()]
-        nodes = {}
+            for (node_from, node_to), (failed, policy) in self._pair_cannot_send.items()
+            if is_ours(None, node_from, node_to)]
+        failures_of_nodes = {}
         for node_to, (_, node_failures) in self._node_cannot_receive.items():
             policies = self._node_failed_policies.get(node_to, _NO_POLICIES)
             failures = {}
             for n, failed in node_failures.items():
-                if not failed.is_invalid():
+                # (amount() looks at the clock: it is called once, as the failure may expire meanwhile)
+                if is_ours(None, n, node_to) and (failed_amount := amount(failed)) is not None:
                     # with the policy of its channel that failed, if we know it
-                    failures[n.hex()] = amount(failed) + ([list(policies[n])] if n in policies else [])
+                    failures[n.hex()] = failed_amount + ([list(policies[n])] if n in policies else [])
             if failures:
-                nodes[node_to.hex()] = failures
-        return {'version': self.STATE_VERSION, 'channels': channels, 'pairs': pairs, 'nodes': nodes}
+                failures_of_nodes[node_to.hex()] = failures
+        return {'version': self.STATE_VERSION, 'channels': channels, 'pairs': pairs, 'nodes': failures_of_nodes}
+
+    @staticmethod
+    def channels_and_nodes_of_state(state: dict) -> Tuple[Set[ShortChannelID], Set[bytes]]:
+        """The channels and nodes that what export_state() returned is about."""
+        scids = {ShortChannelID(bytes.fromhex(scid)) for scid in state['channels']}
+        nodes = set()
+        for node_from, node_to, *_ in state['pairs']:
+            nodes.update((bytes.fromhex(node_from), bytes.fromhex(node_to)))
+        for node_to, failures in state['nodes'].items():
+            nodes.add(bytes.fromhex(node_to))
+            nodes.update(bytes.fromhex(n) for n in failures)
+        return scids, nodes
 
     @with_lock
     def import_state(self, state: dict) -> int:
         """Takes over what export_state() of an earlier session returned, and returns for how many channels,
-        node pairs and nodes. What expired is left out. What we learned ourselves takes precedence: if there
-        is any, only the hints of the channels we know nothing about are taken over, as the hints of
-        node pairs and nodes get dropped by later successes, and we cannot tell if these were such.
+        node pairs and nodes. What expired is left out. What we have takes precedence: what we learned, or took
+        over from the saved hints of another wallet. So do the node pairs and nodes we learned about from htlcs
+        since we started: their hints get dropped by later successes, and we cannot tell if these were such.
         Raises if state does not have the form of what export_state() returns, or has amounts or policies
         out of range: nothing is taken over then."""
         if state['version'] != self.STATE_VERSION:
@@ -798,9 +827,6 @@ class LiquidityHintMgr:
         def has_amounts(hint: LiquidityHint) -> bool:
             return any(getattr(hint, name) for name, _ in self._SAVED_AMOUNTS)
 
-        if (self._pair_cannot_send or self._node_cannot_receive
-                or any(has_amounts(hint) for hint in self._liquidity_hints.values())):
-            pairs, nodes = {}, {}
         num_imported = 0
         for scid, amounts in channels.items():
             hint = self._liquidity_hints.get(scid)
@@ -811,13 +837,19 @@ class LiquidityHintMgr:
                 setattr(hint, name, la)
             num_imported += 1
         for pair, (failed, policy) in pairs.items():
-            if failed is not None:
+            if failed is not None and pair not in self._pair_cannot_send and pair not in self._learned_about_pairs:
                 self._pair_cannot_send[pair] = (failed, policy)
                 num_imported += 1
         for node_to, failures in nodes.items():
-            failures = {n: failed for n, failed in failures.items() if failed is not None}
+            if node_to in self._learned_about_nodes:
+                continue
+            _, failures_we_have = self._node_cannot_receive.get(node_to, (0, {}))
+            failures = {n: failed for n, failed in failures.items() if failed is not None and n not in failures_we_have}
             if failures:
-                self._set_node_failures(node_to, failures, policies=node_policies[node_to])
+                policies = {n: p for n, p in node_policies[node_to].items() if n in failures}
+                self._set_node_failures(
+                    node_to, {**failures_we_have, **failures},
+                    policies={**self._node_failed_policies.get(node_to, _NO_POLICIES), **policies})
                 num_imported += 1
         return num_imported
 
@@ -831,6 +863,8 @@ class LiquidityHintMgr:
         self._node_cannot_receive = {}
         self._node_failed_policies = {}
         self._pair_outdated_policy = {}
+        self._learned_about_pairs = set()
+        self._learned_about_nodes = set()
 
     def __repr__(self):
         string = "liquidity hints:\n"
@@ -858,21 +892,28 @@ class LNPathFinder(Logger):
         self._unknown_next_peer_reports = dict()  # type: Dict[bytes, Dict[bytes, int]]
         self._blacklist_lock = threading.Lock()
 
-    def import_saved_liquidity_hints(self, data: Optional[str]) -> None:
+    def import_saved_liquidity_hints(self, data: Optional[str]) -> Tuple[Set[ShortChannelID], Set[bytes]]:
         """Takes over liquidity hints that liquidity_hints_to_save() returned in an earlier session. Our wallets
         keep them: on mobile, the OS kills us soon after the user leaves, and a payment made minutes later
-        would run into the same depleted channels again."""
+        would run into the same depleted channels again. Returns the channels and nodes they are about."""
         if not data:
-            return
+            return set(), set()
         try:
-            num_imported = self.liquidity_hints.import_state(json.loads(data))
+            state = json.loads(data)
+            num_imported = self.liquidity_hints.import_state(state)
+            channels_and_nodes = LiquidityHintMgr.channels_and_nodes_of_state(state)
         except Exception as e:
             self.logger.warning(f"could not load the liquidity hints of earlier sessions: {e!r}")
-        else:
-            self.logger.info(f"loaded {num_imported} liquidity hints of earlier sessions")
+            return set(), set()
+        self.logger.info(f"loaded {num_imported} liquidity hints of earlier sessions")
+        return channels_and_nodes
 
-    def liquidity_hints_to_save(self) -> str:
-        return json.dumps(self.liquidity_hints.export_state(), separators=(',', ':'))
+    def liquidity_hints_to_save(
+            self, *, scids: Optional[Set[ShortChannelID]] = None, nodes: Optional[Set[bytes]] = None,
+    ) -> str:
+        """What the liquidity hints tell, about these channels and nodes if given,
+        see import_saved_liquidity_hints()."""
+        return json.dumps(self.liquidity_hints.export_state(scids=scids, nodes=nodes), separators=(',', ':'))
 
     def reset_liquidity_hints(self) -> None:
         self.liquidity_hints.reset_liquidity_hints()

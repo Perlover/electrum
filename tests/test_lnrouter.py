@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 import random
 import sqlite3
@@ -3387,14 +3388,78 @@ class Test_LNRouter(ElectrumTestCase):
         hints = LiquidityHintMgr()
         hints.update_can_send(a, b, channel(1), amount_msat=3_000_000, policy=policy)
         hints.update_cannot_send(c, b, channel(7), amount_msat=2_000_000, policy=policy)
-        # only the channel to c: we know better what a can send to b, and the failure of the pair a -> b
-        # is older than our forward, which would have dropped it
-        self.assertEqual(1, hints.import_state(state))
+        # only what is about a -> c: we know better what a can send to b, and the failures of the pair a -> b
+        # and of a to b are older than our forward, which would have dropped them
+        self.assertEqual(3, hints.import_state(state))  # the channel, the pair, the node
         self.assertEqual(0, hints.penalty(a, b, channel(1), amount_msat=3_000_000, policy=policy))
         self.assertEqual(inf, hints.penalty(a, c, channel(5), amount_msat=1_000_000, policy=policy))
-        self.assertEqual({(c, b)}, set(hints._pair_cannot_send))
-        self.assertEqual({b}, set(hints._node_cannot_receive))
+        self.assertEqual({(c, b), (a, c)}, set(hints._pair_cannot_send))
+        self.assertEqual({b, c}, set(hints._node_cannot_receive))
         self.assertEqual({c}, set(hints._node_cannot_receive[b][1]))
+
+    def test_saved_hints_of_another_wallet_are_taken_over_too(self):
+        # wallets share the path finder. the second one to take over its hints, before any htlc
+        a, b, c, d = node('a'), node('b'), node('c'), node('d')
+        policy = (1000, 100, 40)
+        of_a, of_b = LiquidityHintMgr(), LiquidityHintMgr()
+        of_a.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        of_b.update_cannot_send(c, b, channel(2), amount_msat=2_000_000, policy=policy)
+        of_b.update_cannot_send(a, b, channel(3), amount_msat=3_000_000, policy=(2000, 200, 40))
+        of_b.update_cannot_send(c, d, channel(4), amount_msat=4_000_000, policy=policy)
+        hints = LiquidityHintMgr()
+        self.assertEqual(3, hints.import_state(of_a.export_state()))  # the channel, the pair, the node
+        # all of it, but what we have: the failure of the pair a -> b, and of a to b
+        self.assertEqual(3 + 2 + 2, hints.import_state(of_b.export_state()))  # channels, pairs, nodes
+        self.assertEqual({(a, b), (c, b), (c, d)}, set(hints._pair_cannot_send))
+        self.assertEqual(1_000_000, hints._pair_cannot_send[(a, b)][0].amount_msat)
+        self.assertEqual({a, c}, set(hints._node_cannot_receive[b][1]))
+        self.assertEqual(1_000_000, hints._node_cannot_receive[b][1][a].amount_msat)  # what we had
+        self.assertEqual({a: policy, c: policy}, hints._node_failed_policies[b])
+        self.assertEqual({c}, set(hints._node_cannot_receive[d][1]))
+        # what we learned about from an htlc since takes precedence (see the test above)
+        hints.update_can_send(a, c, channel(5), amount_msat=1000, policy=policy)
+        of_b.update_cannot_send(a, c, channel(6), amount_msat=2000, policy=policy)
+        hints.import_state(of_b.export_state())
+        self.assertNotIn((a, c), hints._pair_cannot_send)
+        self.assertNotIn(c, hints._node_cannot_receive)
+        hints.reset_liquidity_hints()  # nothing learned any more
+        hints.import_state(of_b.export_state())
+        self.assertIn((a, c), hints._pair_cannot_send)
+        self.assertIn(c, hints._node_cannot_receive)
+
+    def test_saved_hints_are_only_about_the_channels_and_nodes_given(self):
+        a, b, c, d = node('a'), node('b'), node('c'), node('d')
+        policy = (1000, 100, 40)
+        hints = LiquidityHintMgr()
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        hints.update_cannot_send(c, b, channel(2), amount_msat=1_000_000, policy=policy)
+        hints.update_can_send(c, d, channel(3), amount_msat=1_000_000, policy=policy)
+        state = hints.export_state(scids={channel(1), channel(3)}, nodes={a, b})
+        self.assertEqual({channel(1).hex(), channel(3).hex()}, set(state['channels']))
+        self.assertEqual([[a.hex(), b.hex()]], [pair[:2] for pair in state['pairs']])
+        self.assertEqual({b.hex(): {a.hex()}}, {n: set(failures) for n, failures in state['nodes'].items()})
+        self.assertEqual(({channel(1), channel(3)}, {a, b}), LiquidityHintMgr.channels_and_nodes_of_state(state))
+        everything = hints.export_state()
+        self.assertEqual(3, len(everything['channels']))
+        self.assertEqual(({channel(1), channel(2), channel(3)}, {a, b, c}),
+                         LiquidityHintMgr.channels_and_nodes_of_state(everything))
+        self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}},
+                         hints.export_state(scids=set(), nodes=set()))
+
+    def test_export_of_hints_does_not_fail_when_a_failure_expires_meanwhile(self):
+        start = 1_800_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: start):
+            hints = LiquidityHintMgr()
+            for n, number in ((node('a'), 1), (node('b'), 2)):
+                hints.update_cannot_send(n, node('y'), channel(number), amount_msat=1000, policy=(0, 1, 40))
+        # the failures are an hour old, and the clock goes over the second back and forth: whatever it looks
+        # at the clock for, each failure is valid at one look, and expired at the next
+        clock = itertools.cycle((start + HINT_DURATION, start + HINT_DURATION + 1))
+        with mock.patch.object(lnrouter, 'now', lambda: next(clock)):
+            for _ in range(2):
+                state = hints.export_state()
+                for failures in state['nodes'].values():
+                    self.assertTrue(all(failure[:2] == [1000, start] for failure in failures.values()))
 
     def test_import_of_liquidity_hints_that_are_garbage_takes_over_nothing(self):
         good = self._record_liquidity(LiquidityHintMgr()).export_state()

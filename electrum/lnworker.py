@@ -15,6 +15,7 @@ from typing import (
 )
 from types import MappingProxyType
 import threading
+import weakref
 import socket
 from functools import partial
 from collections import defaultdict
@@ -1602,7 +1603,10 @@ class LNWallet(Logger):
         self.wallet = wallet
         self.config = wallet.config
         self.db = wallet.db
-        self._path_finder_with_our_hints = None  # type: Optional[LNPathFinder]  # see _path_finder()
+        self._path_finder_with_our_hints = None  # type: Optional[weakref.ref[LNPathFinder]]  # see _path_finder()
+        # the channels and nodes of the routes of our htlcs: the saved liquidity hints are about these only
+        self._liquidity_hint_scids = set()  # type: Set[ShortChannelID]
+        self._liquidity_hint_nodes = set()  # type: Set[bytes]
         self.instantiation_timestamp = int(time.time())
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
@@ -2589,6 +2593,8 @@ class LNWallet(Logger):
         if attempts is None and self.uses_trampoline():
             # we don't expect lots of failed htlcs with trampoline, so we can fail sooner
             attempts = 30
+        # (not beyond the budget, which the invoice may use up already)
+        final_cltv_buffer = max(0, min(MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT, budget.cltv - min_final_cltv_delta))
         success, reason = False, _("unknown")
         try:
             await self._wait_for_chain_tip()
@@ -2597,7 +2603,7 @@ class LNWallet(Logger):
                 payment_hash=payment_hash,
                 payment_secret=payment_secret,
                 amount_to_pay=amount_to_pay,
-                min_final_cltv_delta=min_final_cltv_delta + MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT,
+                min_final_cltv_delta=min_final_cltv_delta + final_cltv_buffer,
                 r_tags=r_tags,
                 invoice_features=invoice_features,
                 attempts=attempts,
@@ -2631,17 +2637,35 @@ class LNWallet(Logger):
         """The path finder of the network, with the liquidity hints we saved taken over: the first time we
         use it, which is before it is used for our payments, also after a restart of the gossip."""
         path_finder = self.network.path_finder if self.network else None
-        if path_finder is not None and path_finder is not self._path_finder_with_our_hints:
-            self._path_finder_with_our_hints = path_finder
-            path_finder.import_saved_liquidity_hints(self.db.get(self.LIQUIDITY_HINTS_DB_KEY))
+        # (a weak reference: the path finder holds the graph, which is dropped when the gossip stops)
+        old = self._path_finder_with_our_hints() if self._path_finder_with_our_hints else None
+        if path_finder is not None and path_finder is not old:
+            self._path_finder_with_our_hints = weakref.ref(path_finder)
+            scids, nodes = path_finder.import_saved_liquidity_hints(self.db.get(self.LIQUIDITY_HINTS_DB_KEY))
+            self._liquidity_hint_scids |= scids
+            self._liquidity_hint_nodes |= nodes
         return path_finder
 
-    def _save_liquidity_hints(self, path_finder: LNPathFinder) -> None:
-        # written to disk with the state of the channel, which changes with the result of an htlc
-        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, path_finder.liquidity_hints_to_save())
+    def _save_liquidity_hints(self, path_finder: LNPathFinder, route: LNPaymentRoute) -> None:
+        """Saves what the path finder knows about the channels and nodes of this route and of our earlier
+        routes. The wallets that are loaded share the path finder: what it learned from the payments of
+        the others stays out of our wallet file."""
+        for edge in route:
+            self._liquidity_hint_scids.add(edge.short_channel_id)
+            self._liquidity_hint_nodes.update((edge.start_node, edge.end_node))
+        try:
+            data = path_finder.liquidity_hints_to_save(
+                scids=self._liquidity_hint_scids, nodes=self._liquidity_hint_nodes)
+        except Exception:  # the result of the htlc must still be handled
+            self.logger.exception("could not save the liquidity hints")
+            return
+        # written to disk with the state of the channel, the next time it changes
+        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, data)
 
     def forget_saved_liquidity_hints(self) -> None:
         self.db.put(self.LIQUIDITY_HINTS_DB_KEY, None)
+        self._liquidity_hint_scids = set()
+        self._liquidity_hint_nodes = set()
         self.wallet.save_db()
 
     WAIT_FOR_CHAIN_TIP_TIMEOUT = 15  # seconds
@@ -2649,7 +2673,8 @@ class LNWallet(Logger):
     async def _wait_for_chain_tip(self) -> None:
         """The cltv_expiry of our htlcs is counted from our chain tip. Right after the wallet got opened,
         the headers of the blocks mined meanwhile might still be on their way, and a destination that
-        has seen those blocks would reject the htlcs as expiring too soon. So we wait for them a bit."""
+        has seen those blocks would reject the htlcs as expiring too soon. So we wait for them a bit,
+        and while we are not connected to a server, which would tell us about them, for that too."""
         network = self.network
         deadline = time.monotonic() + self.WAIT_FOR_CHAIN_TIP_TIMEOUT
         waited = False
@@ -2984,7 +3009,7 @@ class LNWallet(Logger):
                     route,
                     amount_msat,
                     failing_channel=ShortChannelID(failing_channel))
-                self._save_liquidity_hints(path_finder)
+                self._save_liquidity_hints(path_finder, route)
             # the node likely changed the fee or cltv delta of its parallel channels to the same node too
             if code in (OnionFailureCode.FEE_INSUFFICIENT, OnionFailureCode.INCORRECT_CLTV_EXPIRY) and not blacklist:
                 edge = route[sender_idx + 1]
@@ -4066,7 +4091,7 @@ class LNWallet(Logger):
             if path_finder := self._path_finder():
                 path_finder.update_liquidity_hints(shi.route, shi.amount_receiver_msat)
                 path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=False)
-                self._save_liquidity_hints(path_finder)
+                self._save_liquidity_hints(path_finder, shi.route)
             payment_key = payment_hash + shi.payment_secret_orig
             paysession = self._paysessions[payment_key]
             q = paysession.sent_htlcs_q

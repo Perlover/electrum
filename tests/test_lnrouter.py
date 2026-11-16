@@ -3460,6 +3460,10 @@ class Test_LNRouter(ElectrumTestCase):
         self.assertEqual({}, hints._pair_forwarded)
         self.assertEqual({}, hints._node_received)
 
+    def test_result_of_an_htlc_over_a_route_without_the_channel_that_failed(self):
+        with self.assertRaises(AssertionError):  # a bug of the caller
+            LiquidityHintMgr().update_from_route(self._liquidity_route(42), 1000, failing_channel=channel(99))
+
     def test_export_of_hints_does_not_fail_when_a_failure_expires_meanwhile(self):
         start = 1_800_000_000
         with mock.patch.object(lnrouter, 'now', lambda: start):

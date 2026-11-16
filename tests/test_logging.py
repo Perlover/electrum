@@ -110,6 +110,8 @@ class TestRedactLogText(ElectrumTestCase):
             # a peer, with a host name the user may have typed
             (f'handshake done for {self.NODE_ID}@myhome.duckdns.org:9735',
              f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "myhome.duckdns.org")}:9735'),
+            (f'adding peer {self.NODE_ID}@my_node.lan:9735',
+             f'adding peer {label("node", self.NODE_ID[:10])}@{label("host", "my_node.lan")}:9735'),
             (f'handshake done for {self.NODE_ID}@mynode:9735',
              f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "mynode")}:9735'),
             ('failed to connect node.example.com [Errno -2] Name or service not known',
@@ -195,12 +197,30 @@ class TestRedactLogText(ElectrumTestCase):
         self.assertEqual(expected, redact(text))
         self.assertEqual(redact(text), redact(redact(text)))
         # names that are numbers, or words of the labels, do not break the labels
+        text += _line('lnworker.LNWallet.[AK]', 'route: 0211111111 -[800000x100x1 1+1ppm]-> 0322222222')
         odd = redact(text, wallet_names=['100', '9735', 'node', 'host', 'our', 'wallet'])
+        self.assertIn(label('node', '0211111111', 'our node'), odd)
         self.assertIn(label('ip', '192.168.1.100'), odd)
         self.assertIn(label('host', 'myhome.example'), odd)
         self.assertIn(f'lnworker.LNWallet.[{ak}]', odd)
         self.assertNotRegex(odd, r'<[^<>]*<')  # no label within a label
         self.assertEqual(odd, redact(odd, wallet_names=['100', '9735', 'node', 'host', 'our', 'wallet']))
+
+    def test_wallet_names_with_commas_spaces_and_other_letters(self):
+        for name in ('Alexey, savings', 'Лена, личный', '<w>', 'my savings'):
+            with self.subTest(name=name):
+                text = (_line(f'lnworker.LNWallet.[{name}]', 'x')
+                        + _line(f'lnpeer.Peer.[{name}, 0322222222-1a2b3c4d]', 'y')
+                        + _line('lnworker', f'File "/data/wallets/{name}.tmp", line 1'))
+                w = label('wallet', name)
+                expected = (_line(f'lnworker.LNWallet.[{w}]', 'x')
+                            + _line(f'lnpeer.Peer.[{w}, {label("node", "0322222222")}-1a2b3c4d]', 'y')
+                            + _line('lnworker', f'File "/data/wallets/{w}.tmp", line 1'))
+                self.assertEqual(expected, redact(text))  # one label, the whole name, also if it is not loaded
+                self.assertEqual(expected, redact(text, wallet_names=[name]))
+                # also where only the lines of its peers name it
+                peer_line = _line(f'lnpeer.Peer.[{name}, 0322222222-1a2b3c4d]', 'y')
+                self.assertEqual(expected.splitlines(keepends=True)[1], redact(peer_line))
 
     def test_home_directory_is_replaced(self):
         home = os.path.expanduser('~')

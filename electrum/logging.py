@@ -450,6 +450,8 @@ class _LogRedactor:
         ('address', re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), 0),
         ('onion', re.compile(r'\b[a-z2-7]{56}\.onion\b', re.I), 0),
         ('channel in hex', re.compile(r'(?<![0-9a-fA-F])([0-9a-f]{16}):\d'), 1),  # the key of an htlc
+        ('host', re.compile(r'@([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*):\d'), 1),  # of a peer: node_id@host:port
+        ('host', re.compile(r'failed to connect ([^\s<]+) '), 1),
         ('node', re.compile(r'(?<![0-9a-fA-F])0[23][0-9a-fA-F]{64}(?![0-9a-fA-F])'), 0),
         # 20 bytes or more in hex: hashes, secrets, txids, channel ids, scripts, transactions
         ('hash', re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{40,}(?![0-9a-fA-F])'), 0),
@@ -462,8 +464,6 @@ class _LogRedactor:
         ('ip', re.compile(r'(?<![\w.:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?::'
                           r'(?:(?:[0-9a-fA-F]{1,4}:)*(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{1,4}))?(?![\w:.])'), 0),
         ('ip', re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)(?!\w)'), 0),
-        ('host', re.compile(r'@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*):\d'), 1),  # of a peer: node_id@host:port
-        ('host', re.compile(r'failed to connect ([^\s<]+) '), 1),
         ('server', re.compile(r'interface\.\[([^\]]+)\]'), 1),
         ('payment', re.compile(r'PaySession\.\[([0-9a-f]{8}-[0-9a-f]{4})\]'), 1),
     )
@@ -471,10 +471,10 @@ class _LogRedactor:
     _CHANNELS_WITH_FUNDS = re.compile(r'channels_with_funds: \{.*?\}(?=, have_direct_channel|$)', re.M)
     # where the logs name a wallet, and what a wallet logs about its own payments
     _WALLET_NAMES = (
-        re.compile(r'(?:LNWallet|LNPeerManager)\.\[(?!LNGossip\])([^\]]+)\]'),
-        re.compile(r'Peer\.\[(?!LNGossip,)([^\],]+), '),
-        re.compile(r'/wallets/([^/\s\'"]+)'),
+        re.compile(r'(?:LNWallet|LNPeerManager)\.\[(?!LNGossip\])(.+?)\](?= \||\Z)'),
+        re.compile(r'Peer\.\[(?!LNGossip,)(.+?), (?=[^,\]\n]*\] \||\Z)'),  # (up to the name of the transport)
     )
+    _WALLET_PATH = re.compile(r'/wallets/([^/\s\'"]+)')
     _OUR_CHANNEL = re.compile(r'sent htlc \d+ over ([0-9]+x[0-9]+x[0-9]+)')
     _SCID = re.compile(r'(?<![\w.])\d+x\d+x\d+(?!\w)')
     # the peers of a wallet and the route hints of its invoices are about its channels
@@ -530,7 +530,7 @@ class _LogRedactor:
         # (names in logger names, any of them; elsewhere, those long enough not to be found in other words)
         names_in_logger_names = {
             name for pattern in self._WALLET_NAMES for m in pattern.finditer(text)
-            if not (name := m.group(1)).startswith('<')}
+            if not self._LABEL.fullmatch(name := m.group(1))}
         wallet_names = {name for name in names_in_logger_names | self._wallet_names if len(name) >= 3}
         if self._home:
             text = text.replace(self._home, '~')
@@ -559,13 +559,17 @@ class _LogRedactor:
                 return m.group(0)
             start, end = m.start(1) - m.start(), m.end(1) - m.start()
             return m.group(0)[:start] + self._label('wallet', m.group(1)) + m.group(0)[end:]
-        for pattern in self._WALLET_NAMES:
-            text = outside_labels(lambda part, pattern=pattern: pattern.sub(in_logger_name, part), text)
+        # (the whole names first, then what is left in logger names: e.g. short names)
         if wallet_names:
             names = re.compile(
                 r'(?<![0-9A-Za-z])(?:' + '|'.join(re.escape(v) for v in sorted(wallet_names, key=len, reverse=True))
                 + r')(?![0-9A-Za-z])')
             text = outside_labels(lambda part: names.sub(lambda m: self._label('wallet', m.group(0)), part), text)
+        for pattern in self._WALLET_NAMES:
+            text = outside_labels(lambda part, pattern=pattern: pattern.sub(in_logger_name, part), text)
+        # and the files of wallets that are named nowhere else
+        text = outside_labels(lambda part: self._WALLET_PATH.sub(
+            lambda m: '/wallets/' + self._label('wallet', m.group(1)), part), text)
         return text
 
 

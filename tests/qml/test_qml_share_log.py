@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import pathlib
 import tempfile
 import threading
@@ -38,7 +40,7 @@ class TestShareLogFile(unittest.TestCase):
     """What the Share button produces, through the app's own slot."""
 
     def _share(self, path) -> str:
-        app = _App(SimpleConfig({'electrum_path': path}))
+        app = self._app = _App(SimpleConfig({'electrum_path': path}))
         qeapp.QEAppController.shareLogFile(app)
         self.assertTrue(app._logFileReady.event.wait(30))
         text, error = app._logFileReady.calls[0]
@@ -56,5 +58,13 @@ class TestShareLogFile(unittest.TestCase):
             first = self._share(path)
             self.assertNotIn(NODE[:10], first)
             self.assertNotIn('rent', first)
-            self.assertRegex(first, r'error reported by <node [0-9a-f]{8}>')
+            # labelled with the key of this installation, kept in its config
+            key = bytes.fromhex(self._app.config.LOGS_SHARING_KEY)
+            node_label = hmac.new(key, f'node:{NODE[:10]}'.encode(), hashlib.sha256).hexdigest()[:8]
+            self.assertIn(f'error reported by <node {node_label}>', first)
             self.assertEqual(first, self._share(path))  # a new config object, as after a restart
+            with tempfile.TemporaryDirectory() as other:  # another installation: another key
+                (pathlib.Path(other) / 'logs').mkdir(parents=True)
+                (pathlib.Path(other) / 'logs' / logs.joinpath('electrum_log_20261116T000000Z_1.log').name).write_text(
+                    (logs / 'electrum_log_20261116T000000Z_1.log').read_text(encoding='utf-8'), encoding='utf-8')
+                self.assertNotEqual(first, self._share(other))

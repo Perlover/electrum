@@ -629,6 +629,7 @@ class TestPeerDirect(TestPeer):
         graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['single_chan'])
         p1, p2 = graph.peers.values()
         w1, w2 = graph.workers.values()
+        self._last_graph_workers = w1, w2
         results = {}
         async def pay(lnaddr, pay_req):
             self.assertEqual(PR_UNPAID, w2.get_payment_status(lnaddr.paymenthash, direction=RECEIVED))
@@ -825,6 +826,57 @@ class TestPeerDirect(TestPeer):
                 await w1._wait_for_chain_tip()
             self.assertGreaterEqual(time.monotonic() - t0, 0.6)
             self.assertIn('our chain tip might be behind', '\n'.join(logs.output))
+
+    async def test_log_shared_with_the_developers_has_no_secrets_of_a_payment(self):
+        # what Electrum really logs during a payment (at debug level, as written to the log files)
+        import base64
+        import logging
+        from electrum.logging import file_formatter, filter_log_for_sharing, redact_log_text
+        records = []
+        class Collect(logging.Handler):
+            def emit(self, record):
+                records.append(file_formatter.format(record))
+        handler = Collect(level=logging.DEBUG)
+        root = logging.getLogger()
+        old_level = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        try:
+            with self.assertRaises(PaymentDone):
+                await self._test_simple_payment(test_trampoline=False)
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        alice, bob = self._last_graph_workers
+        # (the wallets of these tests are a subclass from the test module: in the app, it is lnworker's own)
+        log = '\n'.join(records).replace('tests.lnhelpers.MockLNWallet', 'lnworker.LNWallet') + '\n'
+        chan = list(alice.channels.values())[0]
+        payment_hash, = [bytes.fromhex(k) for k in alice.logs]
+        preimage = bob.get_preimage(payment_hash)
+        payment_secret = bob.get_payment_secret(payment_hash)
+        secrets = {
+            'payment hash': payment_hash, 'preimage': preimage, 'payment secret': payment_secret,
+            'channel id': chan.channel_id, 'funding txid': bytes.fromhex(chan.funding_outpoint.txid),
+        }
+        # the log has them, in more than one form
+        self.assertIn(payment_hash.hex(), log)
+        self.assertIn(repr(payment_hash), log)
+        self.assertIn(payment_hash.hex(), filter_log_for_sharing(log))
+        self.assertIn(repr(payment_secret)[2:-1], filter_log_for_sharing(log))
+        shared = redact_log_text(
+            filter_log_for_sharing(log),
+            our_node_ids=[alice.node_keypair.pubkey.hex()],
+            our_channels=[str(chan.short_channel_id)],
+            wallet_names=[alice.wallet.basename()])
+        self.assertIn('sent htlc', shared)  # what it is for is kept
+        self.assertIn('<payment 1>', shared)
+        for name, secret in secrets.items():
+            for form in (secret.hex(), repr(secret)[2:-1], base64.b64encode(secret).decode(), secret.hex()[:16]):
+                self.assertNotIn(form, shared, msg=name)
+        for ours in (alice.node_keypair.pubkey.hex(), alice.node_keypair.pubkey.hex()[:10],
+                     str(chan.short_channel_id), alice.wallet.basename()):
+            self.assertNotIn(ours, shared)
+        self.assertIn(bob.node_keypair.pubkey.hex()[:10], shared)  # a public node, as far as alice knows
 
     async def test_reject_invalid_min_final_cltv_delta(self):
         """

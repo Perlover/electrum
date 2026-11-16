@@ -187,24 +187,25 @@ class TestConfig(QETestCase):
         self.assertEqual(4, len(changes))
 
     def test_write_logs_to_disk(self):
+        from electrum import logging as electrum_logging
+        if electrum_logging.get_logfile_path() is not None:
+            self.skipTest('the test process writes logs to a file already')
         electrum_path = tempfile.mkdtemp(prefix="electrum-unittest-logs-", dir=self._unittest_base_path)
         QEConfig.instance = None
         try:
             q = QEConfig(SimpleConfig({'electrum_path': electrum_path}))
         finally:
             QEConfig.instance = self.q
+        self.addCleanup(electrum_logging.set_file_logging, q.config, False)
         changes = []
-        q.writeLogsToDiskChanged.connect(lambda: changes.append(1))
+        q.writeLogsToDiskChanged.connect(lambda: changes.append(q.logsAreWrittenToDisk))
         self.assertFalse(q.writeLogsToDisk)
-        with mock.patch('electrum.logging.set_file_logging') as set_file_logging, \
-                mock.patch('electrum.logging.get_logfile_path', return_value='/x/electrum_log_1.log'):
-            q.writeLogsToDisk = True
-            set_file_logging.assert_called_once_with(q.config, True)  # at once, not at the next start
-            self.assertTrue(q.config.WRITE_LOGS_TO_DISK)
-            self.assertTrue(q.logsAreWrittenToDisk)
-        with mock.patch('electrum.logging.set_file_logging') as set_file_logging, \
-                mock.patch('electrum.logging.get_logfile_path', return_value=None):
-            q.writeLogsToDisk = False
-            set_file_logging.assert_called_once_with(q.config, False)
-            self.assertFalse(q.logsAreWrittenToDisk)
-        self.assertEqual([1, 1], changes)
+        self.assertFalse(q.logsAreWrittenToDisk)
+        q.writeLogsToDisk = True
+        self.assertTrue(q.config.WRITE_LOGS_TO_DISK)
+        self.assertTrue(q.logsAreWrittenToDisk)  # at once, not at the next start
+        self.assertTrue(os.path.exists(electrum_logging.get_logfile_path()))
+        q.writeLogsToDisk = False
+        self.assertFalse(q.config.WRITE_LOGS_TO_DISK)
+        self.assertFalse(q.logsAreWrittenToDisk)
+        self.assertEqual([True, False], changes)  # (what the GUI reads when it is told)

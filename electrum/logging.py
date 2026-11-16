@@ -18,6 +18,7 @@ import hashlib
 
 if TYPE_CHECKING:
     from .simple_config import SimpleConfig
+    from .wallet import Abstract_Wallet
 
 
 class LogFormatterForFiles(logging.Formatter):
@@ -172,6 +173,10 @@ def _configure_file_logging(
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     PID = os.getpid()
     _logfile_path = log_directory / f"electrum_log_{timestamp}_{PID}.log"
+    num = 1
+    while _logfile_path.exists():  # file logging got switched off and on again within the second
+        _logfile_path = log_directory / f"electrum_log_{timestamp}_{PID}_{num}.log"
+        num += 1
     # we create the file with restrictive perms, instead of letting FileHandler create it
     with open(_logfile_path, "w+") as f:
         os_chmod(_logfile_path, 0o600)
@@ -372,54 +377,165 @@ def read_recent_logs(config: 'SimpleConfig', *, max_size: int) -> str:
     """Returns the end of the newest log files, oldest first: at most max_size bytes, starting at a whole line."""
     parts = []  # newest first
     size = 0
-    starts_mid_line = False  # whether the oldest part we read starts in the middle of its file
+    starts_mid_line = False  # whether the oldest part we read starts in the middle of a line
     for path in reversed(_log_files_oldest_first(pathlib.Path(config.path) / "logs")):
         if size >= max_size:
             break
         try:
             with open(path, 'rb') as f:
                 start = max(0, os.path.getsize(path) - (max_size - size))
-                f.seek(start)
-                data = f.read(max_size - size)
+                f.seek(max(0, start - 1))
+                data = f.read(max_size - size + (1 if start else 0))
         except OSError:
             continue
+        if start:
+            # (the byte before tells whether we start at a whole line)
+            starts_mid_line, data = data[:1] != b'\n', data[1:]
+        else:
+            starts_mid_line = False
         parts.append(data)
         size += len(data)
-        starts_mid_line = start > 0
     text = b''.join(reversed(parts)).decode('utf-8', 'replace')
     if starts_mid_line:
         text = text[text.find('\n') + 1:]
     return text
 
 
-# What is removed from the logs that a user sends to the developers: what identifies the user's coins,
-# payments, addresses and connections. What is about the Lightning network itself is kept, such as the ids
-# of public nodes and channels, the routes, the fees and the error codes, and so are the amounts and times.
-_REDACTIONS = [
-    (re.compile(r'\bln(?:bc|tbs|tb|bcrt|sb)[0-9]*[munp]?1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<invoice>'),
-    (re.compile(r'\bln[oir]1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<bolt12>'),
-    (re.compile(r'\blnurl1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<lnurl>'),
-    (re.compile(r'\b(?:bc|tb|bcrt)1[02-9ac-hj-np-z]{8,87}\b', re.IGNORECASE), '<address>'),
-    (re.compile(r'\b[xyztuvYZUV](?:pub|prv)[1-9A-HJ-NP-Za-km-z]{100,}'), '<xkey>'),
-    (re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), '<address>'),
-    # payment hashes, preimages, secrets, txids, channel ids (but not the 66 of a node id)
-    (re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])'), '<hash>'),
-    (re.compile(r'\b[a-z2-7]{56}\.onion\b'), '<onion>'),
-    (re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])'), '<ip>'),
-    (re.compile(r'(?<![\w:])(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}(?![\w:])'), '<ip>'),
-    (re.compile(r'(?<![\w:])(?:[0-9a-fA-F]{1,4}:)+:(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}(?![\w:])'), '<ip>'),
-]
+# The logs that a user may send to the developers keep only what is about Lightning payments and the network
+# graph: the loggers of these modules. Others print transactions, PSBTs, addresses, labels and the like.
+SHARED_LOG_SOURCES = (
+    'lnworker', 'lnrouter', 'lnpeer', 'channel_db', 'gossip_catch_up', 'trampoline', 'lnverifier', 'lnonion',
+    'mpp_split', 'lnutil',
+)
+_LOG_ENTRY_HEAD = re.compile(r'^\d{8}T\d{6}\.\d+Z \|\s*\w+ \| ([^.| \[]+)')
 
 
-def redact_log_text(text: str, *, private_strings: Iterable[str] = ()) -> str:
-    """Removes private data from log text, see _REDACTIONS. private_strings, such as our node id, the ids
-    of our channels and the names of our wallets, are removed too."""
-    private_strings = sorted({s for s in private_strings if len(s) >= 3}, key=len, reverse=True)
-    if private_strings:
-        text = re.sub('|'.join(re.escape(s) for s in private_strings), '<private>', text)
-    for pattern, replacement in _REDACTIONS:
-        text = pattern.sub(replacement, text)
-    return text
+def filter_log_for_sharing(text: str) -> str:
+    """Keeps the entries of the log written by SHARED_LOG_SOURCES, with the lines that continue them."""
+    kept = []
+    keep = False
+    for line in text.splitlines(keepends=True):
+        if m := _LOG_ENTRY_HEAD.match(line):
+            keep = m.group(1) in SHARED_LOG_SOURCES
+        if keep:
+            kept.append(line)
+    return ''.join(kept)
+
+
+class _LogRedactor:
+    """Replaces what identifies the user's coins, payments and connections in log text by placeholders,
+    numbered within the text, so that what refers to the same thing can still be told."""
+
+    _BECH32 = '02-9ac-hj-np-z'
+    _RULES = (  # (kind, pattern, group to replace or 0). order matters
+        ('bytes', re.compile(r"""\bb(?:'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")"""), 0),
+        ('invoice', re.compile(rf'\b(?:lightning:)?ln(?:bc|tbs|tb|bcrt|sb)[0-9]*[munp]?1[{_BECH32}]{{20,}}', re.I), 0),
+        ('invoice', re.compile(rf'\b(?:lightning:)?ln[oir]1[{_BECH32}]{{20,}}', re.I), 0),
+        ('lnurl', re.compile(rf'\b(?:lightning:)?lnurl1[{_BECH32}]{{20,}}', re.I), 0),
+        ('address', re.compile(rf'\b(?:bc|tb|bcrt)1[{_BECH32}]{{8,87}}\b', re.I), 0),
+        ('key', re.compile(r'\b[xyztuvYZUV](?:pub|prv)[1-9A-HJ-NP-Za-km-z]{100,}'), 0),
+        ('key', re.compile(r'\b[5KLc9][1-9A-HJ-NP-Za-km-z]{50,51}\b'), 0),  # WIF
+        ('address', re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), 0),
+        ('onion', re.compile(r'\b[a-z2-7]{56}\.onion\b', re.I), 0),
+        # 20 bytes or more in hex (hashes, secrets, txids, channel ids, scripts, transactions), but node ids
+        ('hash', re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{40,}(?![0-9a-fA-F])'), 0),
+        ('data', re.compile(r'(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])'), 0),  # base64
+        ('ip', re.compile(r'(?<![\w.:])(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}(?![\w:])'), 0),
+        ('ip', re.compile(r'(?<![\w.:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?::'
+                          r'(?:(?:[0-9a-fA-F]{1,4}:)*(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{1,4}))?(?![\w:.])'), 0),
+        ('ip', re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)(?!\w)'), 0),
+        ('server', re.compile(r'interface\.\[([^\]]+)\]'), 1),
+        ('payment', re.compile(r'PaySession\.\[([0-9a-f]{8}-[0-9a-f]{4})\]'), 1),
+        ('wallet', re.compile(r'(?:LNWallet|LNPeerManager)\.\[(?!LNGossip\])([^\]]+)\]'), 1),
+        ('wallet', re.compile(r'Peer\.\[(?!LNGossip,)([^\],]+), '), 1),
+        ('wallet', re.compile(r'/wallets/([^/\s\'"]+)'), 1),
+    )
+    _NODE_ID = re.compile(r'0[23][0-9a-fA-F]{64}')
+    _HEX = re.compile(r'[0-9a-fA-F]+')
+    _CHANNELS_WITH_FUNDS = re.compile(r'channels_with_funds: \{.*?\}(?=, have_direct_channel|$)', re.M)
+    # what this wallet logs about its own payments
+    _OUR_CHANNEL = re.compile(r'sent htlc \d+ over ([0-9]+x[0-9]+x[0-9]+)')
+    _OUR_FIRST_HOP = re.compile(r'route: ([0-9a-f]{10}) -\[([0-9]+x[0-9]+x[0-9]+) ')
+
+    def __init__(self, *, our_node_ids: Iterable[str] = (), our_channels: Iterable[str] = (),
+                 wallet_names: Iterable[str] = ()):
+        self._numbers = {}  # (kind, value) -> number
+        self._counts = {}  # kind -> how many
+        self._ours = {}  # value -> kind
+        home = os.path.expanduser('~')
+        self._home = home if len(home) > 1 else ''  # (tracebacks show paths in it, with the user name)
+        for kind, values in (('our node', our_node_ids), ('our channel', our_channels), ('wallet', wallet_names)):
+            for value in values:
+                if value and len(value) >= 3:
+                    self._ours[value] = kind
+
+    def _placeholder(self, kind: str, value: str) -> str:
+        key = (kind, value)
+        if key not in self._numbers:
+            self._counts[kind] = self._counts.get(kind, 0) + 1
+            self._numbers[key] = self._counts[kind]
+        return f'<{kind} {self._numbers[key]}>'
+
+    def redact(self, text: str) -> str:
+        ours = dict(self._ours)
+        for m in self._OUR_CHANNEL.finditer(text):
+            ours.setdefault(m.group(1), 'our channel')
+        for m in self._OUR_FIRST_HOP.finditer(text):
+            ours.setdefault(m.group(1), 'our node')
+            ours.setdefault(m.group(2), 'our channel')
+        for value in list(ours):
+            if ours[value] == 'our node' and self._NODE_ID.fullmatch(value):
+                ours.setdefault(value[:10], 'our node')  # routes are logged with the start of node ids
+        our_node_id_starts = {value for value, kind in ours.items() if kind == 'our node' and len(value) == 10}
+        for m in self._NODE_ID.finditer(text):
+            if m.group(0)[:10] in our_node_id_starts:
+                ours.setdefault(m.group(0), 'our node')
+        if self._home:
+            text = text.replace(self._home, '~')
+        if ours:
+            pattern = re.compile(
+                r'(?<![0-9A-Za-z])(?:' + '|'.join(re.escape(v) for v in sorted(ours, key=len, reverse=True))
+                + r')(?![0-9A-Za-z])')
+            text = pattern.sub(lambda m: self._placeholder(ours[m.group(0)], m.group(0)), text)
+        text = self._CHANNELS_WITH_FUNDS.sub('channels_with_funds: <balances>', text)
+        for kind, pattern, group in self._RULES:
+            def replace(m, kind=kind, group=group):
+                if kind == 'hash' and len(m.group(0)) == 66 and m.group(0)[:2] in ('02', '03'):
+                    return m.group(0)  # a node id: the nodes of the network are public
+                if kind == 'data' and self._HEX.fullmatch(m.group(0)):
+                    return m.group(0)  # (what is left of hex are node ids)
+                if group == 0:
+                    return self._placeholder(kind, m.group(0))
+                start, end = m.span(group)
+                return m.group(0)[:start - m.start()] + self._placeholder(kind, m.group(group)) + m.group(0)[end - m.start():]
+            text = pattern.sub(replace, text)
+        return text
+
+
+def what_identifies_us_in_logs(wallets: Iterable['Abstract_Wallet']) -> dict:
+    """The node ids, channels and wallet names of these wallets, as redact_log_text takes them."""
+    from .lnutil import ShortChannelID
+    ours = {'our_node_ids': [], 'our_channels': [], 'wallet_names': []}
+    for wallet in wallets:
+        ours['wallet_names'].append(wallet.basename())
+        lnworker = wallet.lnworker
+        if lnworker is None:
+            continue
+        ours['our_node_ids'].append(lnworker.node_keypair.pubkey.hex())
+        for chan in list(lnworker.channels.values()) + list(lnworker.channel_backups.values()):
+            if chan.short_channel_id:
+                ours['our_channels'].append(str(chan.short_channel_id))
+            for alias in (chan.get_local_scid_alias(), chan.get_remote_scid_alias()):
+                if alias:
+                    ours['our_channels'].append(str(ShortChannelID(alias)))
+    return ours
+
+
+def redact_log_text(text: str, *, our_node_ids: Iterable[str] = (), our_channels: Iterable[str] = (),
+                    wallet_names: Iterable[str] = ()) -> str:
+    """See _LogRedactor. The node ids, channels and wallet names given are replaced too: those of the wallets
+    loaded now. Those of other wallets are found where the logs mention them as ours."""
+    return _LogRedactor(our_node_ids=our_node_ids, our_channels=our_channels, wallet_names=wallet_names).redact(text)
 
 
 def describe_os_version() -> str:

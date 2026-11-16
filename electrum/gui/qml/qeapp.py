@@ -16,7 +16,8 @@ from PyQt6.QtQml import qmlRegisterType, QQmlApplicationEngine
 import electrum
 from electrum import version, constants
 from electrum.i18n import _
-from electrum.logging import Logger, get_logger, read_recent_logs, redact_log_text
+from electrum.logging import (Logger, get_logger, read_recent_logs, redact_log_text, filter_log_for_sharing,
+                              what_identifies_us_in_logs)
 from electrum.bip21 import BITCOIN_BIP21_URI_SCHEME, LIGHTNING_URI_SCHEME
 from electrum.base_crash_reporter import BaseCrashReporter, EarlyExceptionsQueue
 from electrum.network import Network
@@ -24,7 +25,6 @@ from electrum.plugin import run_hook
 from electrum.gui.common_qt.util import get_font_id, break_qt_network
 from electrum.util import profiler
 from electrum.lnurl import SUPPORTED_LNURL_SCHEMES
-from electrum.lnutil import ShortChannelID
 
 from .qeconfig import QEConfig
 from .qedaemon import QEDaemon
@@ -100,7 +100,7 @@ def _share_file(uri, title: str) -> None:
 class QEAppController(BaseCrashReporter, QObject):
     _dummy = pyqtSignal()
     _logFileReady = pyqtSignal(str, str)
-    MAX_SHARED_LOG_SIZE = 10_000_000  # characters, from the end of the newest log files
+    MAX_SHARED_LOG_SIZE = 20_000_000  # bytes read from the end of the newest log files, before filtering
     userNotify = pyqtSignal(str, str)
     uriReceived = pyqtSignal(str)
     showException = pyqtSignal('QVariantMap')
@@ -352,7 +352,8 @@ class QEAppController(BaseCrashReporter, QObject):
             return
         self._log_file_busy = True
         try:
-            private_strings = self._private_strings_for_logs()
+            daemon = QEDaemon.instance.daemon if QEDaemon.instance else None
+            ours = what_identifies_us_in_logs(daemon.get_wallets().values() if daemon else [])
         except Exception:
             self.logger.exception('failed to collect what to remove from the logs')
             self._log_file_busy = False
@@ -361,31 +362,12 @@ class QEAppController(BaseCrashReporter, QObject):
 
         def task():
             try:
-                text = read_recent_logs(self.config, max_size=self.MAX_SHARED_LOG_SIZE)
-                self._logFileReady.emit(redact_log_text(text, private_strings=private_strings), '')
+                text = filter_log_for_sharing(read_recent_logs(self.config, max_size=self.MAX_SHARED_LOG_SIZE))
+                self._logFileReady.emit(redact_log_text(text, **ours), '')
             except Exception as e:
                 self.logger.exception('failed to collect the logs')
                 self._logFileReady.emit('', repr(e))
         threading.Thread(target=task, daemon=True, name='log-file').start()
-
-    def _private_strings_for_logs(self) -> List[str]:
-        """what identifies us in the logs, beyond what redact_log_text finds by itself"""
-        strings = []
-        daemon = QEDaemon.instance.daemon if QEDaemon.instance else None
-        for wallet in (daemon.get_wallets().values() if daemon else []):
-            strings.append(wallet.basename())
-            lnworker = wallet.lnworker
-            if lnworker is None:
-                continue
-            node_id = lnworker.node_keypair.pubkey.hex()
-            strings += [node_id, node_id[:10]]  # (routes are logged with the start of node ids)
-            for chan in lnworker.channels.values():
-                if chan.short_channel_id:
-                    strings.append(str(chan.short_channel_id))
-                for alias in (chan.get_local_scid_alias(), chan.get_remote_scid_alias()):
-                    if alias:
-                        strings.append(str(ShortChannelID(alias)))
-        return strings
 
     def _on_log_file_ready(self, text: str, error: str):
         self._log_file_busy = False
@@ -397,7 +379,8 @@ class QEAppController(BaseCrashReporter, QObject):
             return
         try:
             if systemSdkVersion < 29:  # no MediaStore.Downloads: share the end of it as plain text instead
-                self.doShare(text[-100_000:], _('Electrum log'))
+                end = text[-100_000:]
+                self.doShare(end[end.find('\n') + 1:] if len(text) > len(end) else end, _('Electrum log'))
                 return
             filename = f'electrum-log-{time.strftime("%Y%m%d-%H%M%S")}.txt'
             uri = _save_text_to_downloads(filename, text)

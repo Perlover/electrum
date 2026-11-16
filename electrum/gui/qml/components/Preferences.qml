@@ -593,6 +593,43 @@ Pane {
                             wrapMode: Text.Wrap
                         }
                     }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        visible: AppController.isAndroid()
+                        Switch {
+                            id: writeLogsToDisk
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.writeLogsToDisk = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Write a log file, to send it to the developers if something goes wrong')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    Button {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        visible: AppController.isAndroid() && Config.logsAreWrittenToDisk
+                        text: qsTr('Share log file')
+                        onClicked: {
+                            var dialog = app.messageDialog.createObject(app, {
+                                title: qsTr('Share log file'),
+                                text: qsTr('The log shows what the app did recently, including the amounts, times and routes of your Lightning payments, and the nodes it connected to. Invoices, payment hashes, addresses, transaction ids, IP addresses, your node id, the ids of your channels and the names of your wallets are removed from it. Have a look at it before you send it.'),
+                                yesno: true
+                            })
+                            dialog.accepted.connect(function() {
+                                AppController.shareLogFile()
+                            })
+                            dialog.open()
+                        }
+                    }
                 }
             }
         }
@@ -614,6 +651,7 @@ Pane {
         gossipBackgroundSyncUnmeteredOnly.checked = Config.gossipBackgroundSyncUnmeteredOnly
         gossipBackgroundSyncChargingOnly.checked = Config.gossipBackgroundSyncChargingOnly
         enableDebugLogs.checked = Config.enableDebugLogs
+        writeLogsToDisk.checked = Config.writeLogsToDisk
         disableScreenshots.checked = !Config.alwaysAllowScreenshots && AppController.isAndroid()
         setMaxBrightnessOnQrDisplay.checked = Config.setMaxBrightnessOnQrDisplay && AppController.isAndroid()
         useRecoverableChannels.checked = Config.useRecoverableChannels

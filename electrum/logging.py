@@ -10,7 +10,8 @@ import sys
 import pathlib
 import os
 import platform
-from typing import Optional, TYPE_CHECKING, Set
+import re
+from typing import Optional, TYPE_CHECKING, Set, Iterable, List
 import copy
 import subprocess
 import hashlib
@@ -117,24 +118,27 @@ class TruncatingMemoryHandler(logging.handlers.MemoryHandler):
         super().close()
 
 
+def _sortkey_of_log_file_oldest_first(p: pathlib.PurePath):
+    fname = p.name
+    basename, ext, counter = str(fname).partition(".log")
+    # - each time electrum is launched, there will be a new basename, ordered by date
+    # - for any given basename, there might be multiple log files, differing by counter
+    #   - empty counter is newest, then .1 is older, .2 is even older, etc
+    try:
+        counter = int(counter[1:]) if counter else 0  # convert ".2" -> 2
+    except ValueError:
+        _logger.warning(f"failed to parse log file name: {fname}")
+        counter = 0
+    return basename, -counter
+
+
+def _log_files_oldest_first(path) -> List[pathlib.Path]:
+    return sorted(pathlib.Path(path).glob("electrum_log_*.log*"), key=_sortkey_of_log_file_oldest_first)
+
+
 def _delete_old_logs(path, *, num_files_keep: int, max_total_size: int):
     """Delete old logfiles, only keeping the latest few."""
-    def sortkey_oldest_first(p: pathlib.PurePath):
-        fname = p.name
-        basename, ext, counter = str(fname).partition(".log")
-        # - each time electrum is launched, there will be a new basename, ordered by date
-        # - for any given basename, there might be multiple log files, differing by counter
-        #   - empty counter is newest, then .1 is older, .2 is even older, etc
-        try:
-            counter = int(counter[1:]) if counter else 0  # convert ".2" -> 2
-        except ValueError:
-            _logger.warning(f"failed to parse log file name: {fname}")
-            counter = 0
-        return basename, -counter
-    files = sorted(
-        list(pathlib.Path(path).glob("electrum_log_*.log*")),
-        key=sortkey_oldest_first,
-    )
+    files = _log_files_oldest_first(path)
     total_size = sum(os.stat(f).st_size for f in files)  # in bytes
     num_files_remaining = len(files)
     for f in files:
@@ -150,6 +154,7 @@ def _delete_old_logs(path, *, num_files_keep: int, max_total_size: int):
 
 
 _logfile_path = None
+_file_handler = None  # type: Optional[logging.Handler]
 def _configure_file_logging(
     log_directory: pathlib.Path,
     *,
@@ -158,7 +163,7 @@ def _configure_file_logging(
 ):
     from .util import os_chmod
 
-    global _logfile_path
+    global _logfile_path, _file_handler
     assert _logfile_path is None, 'file logging already initialized'
     log_directory.mkdir(exist_ok=True, mode=0o700)
 
@@ -180,6 +185,7 @@ def _configure_file_logging(
     file_handler.setFormatter(file_formatter)
     file_handler.setLevel(logging.DEBUG)
     root_logger.addHandler(file_handler)
+    _file_handler = file_handler
     if _inmemory_startup_logs:
         _inmemory_startup_logs.dump_to_target(file_handler)
 
@@ -342,6 +348,78 @@ def configure_logging(config: 'SimpleConfig', *, log_to_file: Optional[bool] = N
 
 def get_logfile_path() -> Optional[pathlib.Path]:
     return _logfile_path
+
+
+def set_file_logging(config: 'SimpleConfig', enabled: bool) -> None:
+    """Starts or stops writing the logs to files, while running. (configure_logging does it at startup)"""
+    from .util import is_android_debug_apk
+    global _logfile_path, _file_handler
+    if enabled and _logfile_path is None:
+        _configure_file_logging(
+            pathlib.Path(config.path) / "logs",
+            num_files_keep=config.LOGS_NUM_FILES_KEEP,
+            max_total_size=config.LOGS_MAX_TOTAL_SIZE_BYTES)
+        _logger.info(f"Logging to file: {str(_logfile_path)}")
+    elif not enabled and _file_handler is not None and not is_android_debug_apk():
+        _logger.info("Logging to file stops")
+        root_logger.removeHandler(_file_handler)
+        _file_handler.close()
+        _file_handler = None
+        _logfile_path = None
+
+
+def read_recent_logs(config: 'SimpleConfig', *, max_size: int) -> str:
+    """Returns the end of the newest log files, oldest first: at most max_size bytes, starting at a whole line."""
+    parts = []  # newest first
+    size = 0
+    starts_mid_line = False  # whether the oldest part we read starts in the middle of its file
+    for path in reversed(_log_files_oldest_first(pathlib.Path(config.path) / "logs")):
+        if size >= max_size:
+            break
+        try:
+            with open(path, 'rb') as f:
+                start = max(0, os.path.getsize(path) - (max_size - size))
+                f.seek(start)
+                data = f.read(max_size - size)
+        except OSError:
+            continue
+        parts.append(data)
+        size += len(data)
+        starts_mid_line = start > 0
+    text = b''.join(reversed(parts)).decode('utf-8', 'replace')
+    if starts_mid_line:
+        text = text[text.find('\n') + 1:]
+    return text
+
+
+# What is removed from the logs that a user sends to the developers: what identifies the user's coins,
+# payments, addresses and connections. What is about the Lightning network itself is kept, such as the ids
+# of public nodes and channels, the routes, the fees and the error codes, and so are the amounts and times.
+_REDACTIONS = [
+    (re.compile(r'\bln(?:bc|tbs|tb|bcrt|sb)[0-9]*[munp]?1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<invoice>'),
+    (re.compile(r'\bln[oir]1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<bolt12>'),
+    (re.compile(r'\blnurl1[02-9ac-hj-np-z]{20,}', re.IGNORECASE), '<lnurl>'),
+    (re.compile(r'\b(?:bc|tb|bcrt)1[02-9ac-hj-np-z]{8,87}\b', re.IGNORECASE), '<address>'),
+    (re.compile(r'\b[xyztuvYZUV](?:pub|prv)[1-9A-HJ-NP-Za-km-z]{100,}'), '<xkey>'),
+    (re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), '<address>'),
+    # payment hashes, preimages, secrets, txids, channel ids (but not the 66 of a node id)
+    (re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])'), '<hash>'),
+    (re.compile(r'\b[a-z2-7]{56}\.onion\b'), '<onion>'),
+    (re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])'), '<ip>'),
+    (re.compile(r'(?<![\w:])(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}(?![\w:])'), '<ip>'),
+    (re.compile(r'(?<![\w:])(?:[0-9a-fA-F]{1,4}:)+:(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}(?![\w:])'), '<ip>'),
+]
+
+
+def redact_log_text(text: str, *, private_strings: Iterable[str] = ()) -> str:
+    """Removes private data from log text, see _REDACTIONS. private_strings, such as our node id, the ids
+    of our channels and the names of our wallets, are removed too."""
+    private_strings = sorted({s for s in private_strings if len(s) >= 3}, key=len, reverse=True)
+    if private_strings:
+        text = re.sub('|'.join(re.escape(s) for s in private_strings), '<private>', text)
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def describe_os_version() -> str:

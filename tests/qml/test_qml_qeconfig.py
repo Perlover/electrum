@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+from unittest import mock
 from typing import TYPE_CHECKING
 
 from electrum import SimpleConfig
@@ -184,3 +185,26 @@ class TestConfig(QETestCase):
         self.assertTrue(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED)
         self.assertEqual([1], asked)
         self.assertEqual(4, len(changes))
+
+    def test_write_logs_to_disk(self):
+        electrum_path = tempfile.mkdtemp(prefix="electrum-unittest-logs-", dir=self._unittest_base_path)
+        QEConfig.instance = None
+        try:
+            q = QEConfig(SimpleConfig({'electrum_path': electrum_path}))
+        finally:
+            QEConfig.instance = self.q
+        changes = []
+        q.writeLogsToDiskChanged.connect(lambda: changes.append(1))
+        self.assertFalse(q.writeLogsToDisk)
+        with mock.patch('electrum.logging.set_file_logging') as set_file_logging, \
+                mock.patch('electrum.logging.get_logfile_path', return_value='/x/electrum_log_1.log'):
+            q.writeLogsToDisk = True
+            set_file_logging.assert_called_once_with(q.config, True)  # at once, not at the next start
+            self.assertTrue(q.config.WRITE_LOGS_TO_DISK)
+            self.assertTrue(q.logsAreWrittenToDisk)
+        with mock.patch('electrum.logging.set_file_logging') as set_file_logging, \
+                mock.patch('electrum.logging.get_logfile_path', return_value=None):
+            q.writeLogsToDisk = False
+            set_file_logging.assert_called_once_with(q.config, False)
+            self.assertFalse(q.logsAreWrittenToDisk)
+        self.assertEqual([1, 1], changes)

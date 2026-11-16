@@ -340,6 +340,10 @@ class BackgroundCatchUpManager:
         background_since = self._background_since
         if lngossip is not None:
             if is_job_running or background_since is None:
+                from .lnworker import LNGossip
+                # Woken up by the OS only to catch up, we save traffic as the background process does:
+                # peers resend the same gossip, so a second source is of little use.
+                lngossip.GOSSIP_BACKLOG_NUM_PEERS = 1 if background_since is not None else LNGossip.GOSSIP_BACKLOG_NUM_PEERS
                 if lngossip.is_paused():
                     lngossip.resume()
             elif now - background_since >= self.BACKGROUND_GRACE and not lngossip.is_paused():

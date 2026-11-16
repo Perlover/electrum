@@ -759,6 +759,8 @@ class LNGossip(Logger):
         self._gossip_rx_samples = {}  # type: Dict[Peer, List[Tuple[float, int]]]
         self._gossip_last_tick = None  # type: Optional[float]
         self._gossip_paused = False  # see pause()
+        # when this session started to ask its peers for new gossip, if it had no idea until when it had it
+        self._gossip_news_since = None  # type: Optional[int]
         self._gossip_last_rx_time = 0.  # type: float  # when we last noticed that gossip arrived
         self._gossip_num_msgs_received = 0  # type: int
         self._gossip_synced_until_saved = 0.  # type: float
@@ -863,8 +865,14 @@ class LNGossip(Logger):
             start = self._gossip_synced_until - self.GOSSIP_SYNCED_MARGIN
         elif (latest_ts := self.channel_db.latest_policy_ts_at_load) is not None:
             start = latest_ts - self.GOSSIP_BACKLOG_MARGIN
+        elif self._gossip_news_since is not None:
+            # The db had no policies, and the first catch-up got interrupted (a suspend, a pause):
+            # the channels we fetched since then are known now, so their updates have to be asked for.
+            start = self._gossip_news_since - self.GOSSIP_SYNCED_MARGIN
         else:
-            start = None  # no policies: the channels get queried in full, as they are not known
+            # no policies: the channels get queried in full, as they are not known
+            start = None
+            self._gossip_news_since = now
         if start is not None:
             start = min(max(start, now - self.max_age), now)
         self._gossip_backlog_useless = set()
@@ -1012,6 +1020,12 @@ class LNGossip(Logger):
             elif (now - self._gossip_last_rx_time > self.GOSSIP_MAX_SILENCE
                     and self.channel_db.num_policies >= 100 * self.GOSSIP_BACKLOG_MIN_UPDATES):
                 self.logger.info("no gossip from our peers for a while. will catch up on gossip")
+            elif (self._gossip_synced_until is not None and min(
+                    peer.our_gossip_timestamp_filter.first_timestamp for peer in peers)
+                    > max(self._gossip_synced_until, int(self._gossip_last_rx_time)) + 2 * self.GOSSIP_SYNC_TICK):
+                # E.g. the connections died without closing, and each got replaced by a peer that relays
+                # only new gossip, but not before the next one connected: no tick saw that we had none.
+                self.logger.info("our gossip peers all connected after we last had gossip. will catch up on gossip")
             else:
                 # (not "now": the peers might have stopped relaying gossip)
                 self._advance_gossip_synced_until()
@@ -1132,6 +1146,7 @@ class LNGossip(Logger):
                     self._request_gossip(peer, int(now))
         # Ask the peers that are already connected, as they will not get replaced by new ones.
         # (also after a suspend: if a connection is dead, the peer is gone by one of the next ticks)
+        peers = [peer for peer in peers if peer in self.lnpeermgr.peers.values()]  # not those dropped above
         for peer in peers:
             # (not during a query for channels: the reply consists of old gossip as well)
             if not peer.is_querying_short_channel_ids and self._should_ask_for_gossip_backlog(peer, peers, now):

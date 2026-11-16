@@ -274,6 +274,7 @@ class TestGossipCatchUp(ElectrumTestCase):
             self.assertIn(f'android:name="org.electrum.gossip.{name}"', hook)
             self.assertTrue(os.path.exists(os.path.join(java_dir, name + '.java')))
         # the job runs about every interval: with a flex, see GossipSyncJobService.schedule
+        # (a text guard only: the java code does not run in these tests)
         self.assertIn('.setPeriodic(intervalMillis, flexMillis)', job_service)
         self.assertIn('long flexMillis = Math.max(intervalMillis / 4, JobInfo.getMinFlexMillis());', job_service)
         # what python calls on the job service
@@ -469,6 +470,29 @@ class TestBackgroundCatchUpManager(ElectrumTestCase):
                 self.manager.poll(network)
             lngossip.pause.assert_called_once_with()
         self.job_service.finishJobInApp.assert_not_called()
+
+    def test_catch_up_for_the_job_asks_a_single_peer_for_the_backlog_as_the_background_process_does(self):
+        from electrum.lnworker import LNGossip
+        self.assertEqual(2, LNGossip.GOSSIP_BACKLOG_NUM_PEERS)
+        lngossip = self._lngossip(is_paused=True)
+        network = mock.Mock(lngossip=lngossip)
+        self.manager.set_app_in_background(True)
+        self.job_service.isJobRunningInApp.return_value = True
+        self.manager.poll(network)
+        self.assertEqual(1, lngossip.GOSSIP_BACKLOG_NUM_PEERS)
+        # the user comes back: the usual second source
+        self.job_service.isJobRunningInApp.return_value = False
+        self.manager.set_app_in_background(False)
+        self.manager.poll(network)
+        self.assertEqual(2, lngossip.GOSSIP_BACKLOG_NUM_PEERS)
+        # also while the job is still running
+        self.manager.set_app_in_background(True)
+        self.job_service.isJobRunningInApp.return_value = True
+        self.manager.poll(network)
+        self.assertEqual(1, lngossip.GOSSIP_BACKLOG_NUM_PEERS)
+        self.manager.set_app_in_background(False)
+        self.manager.poll(network)
+        self.assertEqual(2, lngossip.GOSSIP_BACKLOG_NUM_PEERS)
 
     def test_gossip_is_resumed_for_the_job_and_paused_again_after_it(self):
         lngossip = self._lngossip(is_paused=True)

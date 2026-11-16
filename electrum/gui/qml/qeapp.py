@@ -368,6 +368,7 @@ class QEAppController(BaseCrashReporter, QObject):
             except Exception as e:
                 self.logger.exception('failed to collect the logs')
                 self._logFileReady.emit('', repr(e))
+        self.userNotify.emit('', _('Collecting the log...'))
         threading.Thread(target=task, daemon=True, name='log-file').start()
 
     def _on_log_file_ready(self, text: str, error: str):

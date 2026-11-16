@@ -621,7 +621,7 @@ Pane {
                         onClicked: {
                             var dialog = app.messageDialog.createObject(app, {
                                 title: qsTr('Share log file'),
-                                text: qsTr('The file will contain the part of the log about Lightning payments and the network graph: amounts, times, fees, routes and errors. Node ids, channels, invoices, payment hashes and secrets, transactions, addresses, IP addresses and the names of your wallets are replaced by labels that cannot be turned back into them: the same value gets the same label, also in the logs you share later. A copy is saved in Downloads. Send it only to the developers.'),
+                                text: qsTr('The file will contain the part of the log about Lightning payments and the network graph: amounts, times, fees, routes and errors. Node ids, channels, invoices, payment hashes and secrets, transactions, addresses, IP addresses and the names of your wallets are replaced by labels that cannot be turned back into them: the same value gets the same label, also in the logs you share later. On Android 10 and later, a copy is saved in Downloads. Send it only to the developers.'),
                                 yesno: true
                             })
                             dialog.accepted.connect(function() {

@@ -395,6 +395,8 @@ def read_recent_logs(config: 'SimpleConfig', *, max_size: int) -> str:
             starts_mid_line, data = data[:1] != b'\n', data[1:]
         else:
             starts_mid_line = False
+        if data and not data.endswith(b'\n'):
+            data += b'\n'  # the file got cut, e.g. as we were killed while writing it
         parts.append(data)
         size += len(data)
     text = b''.join(reversed(parts)).decode('utf-8', 'replace')
@@ -408,6 +410,7 @@ def read_recent_logs(config: 'SimpleConfig', *, max_size: int) -> str:
 SHARED_LOG_SOURCES = (
     'lnworker', 'lnrouter', 'lnpeer', 'channel_db', 'gossip_catch_up', 'trampoline', 'lnverifier', 'lnonion',
     'mpp_split', 'lnutil',
+    'logging',  # the version of Electrum and of the OS
 )
 _LOG_ENTRY_HEAD = re.compile(r'^\d{8}T\d{6}\.\d+Z \|\s*\w+ \| ([^.| \[]+)')
 
@@ -441,6 +444,7 @@ class _LogRedactor:
         ('key', re.compile(r'\b[5KLc9][1-9A-HJ-NP-Za-km-z]{50,51}\b'), 0),  # WIF
         ('address', re.compile(r'\b[13mn2][1-9A-HJ-NP-Za-km-z]{25,34}\b'), 0),
         ('onion', re.compile(r'\b[a-z2-7]{56}\.onion\b', re.I), 0),
+        ('channel in hex', re.compile(r'(?<![0-9a-fA-F])([0-9a-f]{16}):\d'), 1),  # the key of an htlc
         ('node', re.compile(r'(?<![0-9a-fA-F])0[23][0-9a-fA-F]{64}(?![0-9a-fA-F])'), 0),
         # 20 bytes or more in hex: hashes, secrets, txids, channel ids, scripts, transactions
         ('hash', re.compile(r'(?<![0-9a-fA-F])[0-9a-fA-F]{40,}(?![0-9a-fA-F])'), 0),
@@ -453,6 +457,7 @@ class _LogRedactor:
         ('ip', re.compile(r'(?<![\w.:])(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?::'
                           r'(?:(?:[0-9a-fA-F]{1,4}:)*(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{1,4}))?(?![\w:.])'), 0),
         ('ip', re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)(?!\w)'), 0),
+        ('host', re.compile(r'@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):\d'), 1),  # of a peer: node_id@host:port
         ('server', re.compile(r'interface\.\[([^\]]+)\]'), 1),
         ('payment', re.compile(r'PaySession\.\[([0-9a-f]{8}-[0-9a-f]{4})\]'), 1),
     )
@@ -464,6 +469,11 @@ class _LogRedactor:
         re.compile(r'/wallets/([^/\s\'"]+)'),
     )
     _OUR_CHANNEL = re.compile(r'sent htlc \d+ over ([0-9]+x[0-9]+x[0-9]+)')
+    _SCID = re.compile(r'(?<![\w.])\d+x\d+x\d+(?!\w)')
+    # the peers of a wallet and the route hints of its invoices are about its channels
+    _ABOUT_OUR_CHANNELS = re.compile(
+        r'^[^|\n]*\|[^|\n]*\| (?:lnpeer\.Peer\.\[(?!LNGossip,)[^\]\n]*\] \| .*'
+        r'|lnworker\.LNWallet\.\[[^\]\n]*\] \| creating bolt11 invoice with routing_hints: .*)$', re.M)
     _OUR_FIRST_HOP = re.compile(r'route: (0[23][0-9a-f]{8}) -\[([0-9]+x[0-9]+x[0-9]+) ')
 
     def __init__(self, *, key: bytes, our_node_ids: Iterable[str] = (), our_channels: Iterable[str] = (),
@@ -505,6 +515,8 @@ class _LogRedactor:
 
     def redact(self, text: str) -> str:
         self._our_channels.update(m.group(1) for m in self._OUR_CHANNEL.finditer(text))
+        for m in self._ABOUT_OUR_CHANNELS.finditer(text):
+            self._our_channels.update(self._SCID.findall(m.group(0)))
         for m in self._OUR_FIRST_HOP.finditer(text):
             self._our_nodes.add(m.group(1))
             self._our_channels.add(m.group(2))
@@ -524,8 +536,14 @@ class _LogRedactor:
             def replace(m, kind=kind, group=group):
                 if group == 0:
                     return self._label(kind, m.group(0))
+                if kind == 'channel in hex':
+                    value = bytes.fromhex(m.group(group))
+                    new = self._label('channel', '{}x{}x{}'.format(
+                        int.from_bytes(value[:3], 'big'), int.from_bytes(value[3:6], 'big'), int.from_bytes(value[6:], 'big')))
+                else:
+                    new = self._label(kind, m.group(group))
                 start, end = m.span(group)
-                return m.group(0)[:start - m.start()] + self._label(kind, m.group(group)) + m.group(0)[end - m.start():]
+                return m.group(0)[:start - m.start()] + new + m.group(0)[end - m.start():]
             text = pattern.sub(replace, text)
         return text
 

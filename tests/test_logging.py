@@ -29,6 +29,7 @@ class TestFilterLogForSharing(ElectrumTestCase):
             _line('lnworker.LNWallet.[w]', 'Exception in pay_to_node: PaymentFailure()', 'ERROR')
             + 'Traceback (most recent call last):\n  File "lnworker.py", line 1\nPaymentFailure\n',
         ]
+        kept.append(_line('logging', 'Electrum version: 4.8.4 - https://electrum.org'))
         dropped = [
             _line('lnchannel.Channel.[w, 0x1x1]', "sign_next_commitment. psbt='cHNidP8BAN8CAAAAAVY'", 'DEBUG'),
             _line('interface.[myhome.example:50002]', 'connection established'),
@@ -104,6 +105,11 @@ class TestRedactLogText(ElectrumTestCase):
              f'route: {label("node", "0322222222", "our node")} -[{label("channel", "700000x5x0", "our channel")} 0+0ppm cltv 40]-> '
              f'{label("node", "0344444444")}'),
             ('htlc failed at edge 3 of 4 (channel 700123x456x7)', f'htlc failed at edge 3 of 4 (channel {label("channel", "700123x456x7")})'),
+            # the key of an htlc, with the short channel id in hex
+            ("payment_key='0c35000000640001:0'", f"payment_key='{label('channel', '800000x100x1')}:0'"),
+            # a peer, with a host name the user may have typed
+            (f'handshake done for {self.NODE_ID}@myhome.duckdns.org:9735',
+             f'handshake done for {label("node", self.NODE_ID[:10])}@{label("host", "myhome.duckdns.org")}:9735'),
             ('catching up on gossip. peers (msgs/s, old updates): 03abcd 12 300 done, 02ef01 ? 0. unknown_ids=3',
              f'catching up on gossip. peers (msgs/s, old updates): {label("node", "03abcd")} 12 300 done, {label("node", "02ef01")} ? 0. '
              'unknown_ids=3'),
@@ -154,7 +160,11 @@ class TestRedactLogText(ElectrumTestCase):
                       'route: 0211111111 -[800000x100x1 1000+1ppm, own channel]-> 0322222222')
                 + _line('lnworker.LNWallet.[savings]', 'htlc succeeded. route: 0211111111 -[800000x200x0 1000+1ppm]-> 0355555555')
                 + _line('lnpeer.Peer.[savings, 0322222222-1a2b3c4d]', 'loaded wallet savings; 0211111111' + '22' * 28)
-                + _line('storage', 'wallet path /data/files/wallets/default_wallet'))
+                + _line('storage', 'wallet path /data/files/wallets/default_wallet')
+                + _line('lnpeer.Peer.[savings, 0322222222-1a2b3c4d]', 'channel_reestablish (800000x300x2): replayed 0')
+                + _line('lnworker.LNWallet.[savings]', "creating bolt11 invoice with routing_hints: [('r', "
+                        "[('0322222222', '16000000x1x2', 1000, 1, 144)])]")
+                + _line('lnpeer.Peer.[LNGossip, 0322222222-1a2b3c4d]', 'query 700000x1x1'))
         w, us = label('wallet', 'savings'), label('node', '0211111111', 'our node')
         c1, c2 = label('channel', '800000x100x1', 'our channel'), label('channel', '800000x200x0', 'our channel')
         self.assertEqual(
@@ -162,7 +172,12 @@ class TestRedactLogText(ElectrumTestCase):
                   f'route: {us} -[{c1} 1000+1ppm, own channel]-> {label("node", "0322222222")}')
             + _line(f'lnworker.LNWallet.[{w}]', f'htlc succeeded. route: {us} -[{c2} 1000+1ppm]-> {label("node", "0355555555")}')
             + _line(f'lnpeer.Peer.[{w}, {label("node", "0322222222")}-1a2b3c4d]', f'loaded wallet {w}; {us}')
-            + _line('storage', f'wallet path /data/files/wallets/{label("wallet", "default_wallet")}'),
+            + _line('storage', f'wallet path /data/files/wallets/{label("wallet", "default_wallet")}')
+            + _line(f'lnpeer.Peer.[{w}, {label("node", "0322222222")}-1a2b3c4d]',
+                    f'channel_reestablish ({label("channel", "800000x300x2", "our channel")}): replayed 0')
+            + _line(f'lnworker.LNWallet.[{w}]', f"creating bolt11 invoice with routing_hints: [('r', "
+                    f"[('{label('node', '0322222222')}', '{label('channel', '16000000x1x2', 'our channel')}', 1000, 1, 144)])]")
+            + _line(f'lnpeer.Peer.[LNGossip, {label("node", "0322222222")}-1a2b3c4d]', f'query {label("channel", "700000x1x1")}'),
             redact(text))
 
     def test_home_directory_is_replaced(self):
@@ -237,6 +252,12 @@ class TestReadRecentLogs(ElectrumTestCase):
         self.assertEqual('new-2\n', read_recent_logs(self.config, max_size=7))
         self.assertEqual('new-1\nnew-2\n', read_recent_logs(self.config, max_size=12))  # a whole file
         self.assertEqual('new-2\n', read_recent_logs(self.config, max_size=6))  # starts right at a line
+
+    def test_a_file_cut_in_the_middle_of_a_line_does_not_continue_in_the_next_one(self):
+        with open(self.log_dir / 'electrum_log_20261114T000000Z_1.log', 'w', encoding='utf-8') as f:
+            f.write('old-1\nold-2 cut')
+        self._write('electrum_log_20261115T000000Z_2.log', ['new-1'])
+        self.assertEqual('old-1\nold-2 cut\nnew-1\n', read_recent_logs(self.config, max_size=1000))
 
     def test_no_logs(self):
         self.assertEqual('', read_recent_logs(self.config, max_size=1000))

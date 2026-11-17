@@ -877,6 +877,12 @@ class ChannelDB(SqlDB):
         if forgotten:
             self._db_forget_orphaned_channels(forgotten)
 
+    def get_recently_orphaned_among(self, short_channel_ids: Iterable[bytes]) -> Set[bytes]:
+        """Those of these channels that we pruned recently (see get_recently_orphaned_channel_ids)."""
+        cutoff = int(time.time()) - self.ORPHANED_CHANNEL_REQUERY_DELAY
+        with self.lock:
+            return {scid for scid in short_channel_ids if self._orphaned_channels.get(scid, 0) > cutoff}
+
     def get_recently_orphaned_channel_ids(self) -> Set[ShortChannelID]:
         """Channels that we pruned recently, and that peers will still list in reply_channel_range.
         Requesting them again would download them just to prune them again.

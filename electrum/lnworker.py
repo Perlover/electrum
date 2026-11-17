@@ -1282,8 +1282,10 @@ class LNGossip(Logger):
         new = set(ids) - set(known)
         if skip_recently_orphaned:
             new -= self.channel_db.get_recently_orphaned_channel_ids()
-        if listed_by is not None and len(known) >= self.CHANNEL_QUERY_FIRST_SYNC_CHANNELS:
+        if listed_by is not None and self.channel_db.num_usable_channels >= self.CHANNEL_QUERY_FIRST_SYNC_CHANNELS:
             listed = self._unknown_ids_listed_by
+            for short_channel_id in [scid for scid in listed if scid in known]:
+                del listed[short_channel_id]  # we learned of it otherwise
             confirmed = set()
             for short_channel_id in new:
                 peers = listed.setdefault(short_channel_id, set())
@@ -1371,7 +1373,8 @@ class LNGossip(Logger):
             # Peers also send the announcements of channels we pruned recently, with the same old policies
             # (prune_orphaned_channels): we would add them only to prune them again. A channel that got a
             # fresh policy is alive, and is taken.
-            if new_chan_anns and (recently_orphaned := self.channel_db.get_recently_orphaned_channel_ids()):
+            if new_chan_anns and (recently_orphaned := self.channel_db.get_recently_orphaned_among(
+                    [payload['short_channel_id'] for payload in new_chan_anns])):
                 now = int(time.time())
                 fresh = {
                     payload['short_channel_id'] for payload in chan_upds

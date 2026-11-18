@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+from unittest import mock
 from typing import TYPE_CHECKING
 
 from electrum import SimpleConfig
@@ -150,3 +151,61 @@ class TestConfig(QETestCase):
         self.assertFalse(b.match('1.0000').hasMatch())
         self.assertTrue(b.match('2100000000000000').hasMatch())
         self.assertFalse(b.match('12100000000000000').hasMatch())
+
+    @qt_test
+    def test_gossip_background_sync_settings(self):
+        # a QEConfig of our own: signals need a live QObject, and the shared one died with the app of an earlier test
+        electrum_path = tempfile.mkdtemp(prefix="electrum-unittest-gossip-", dir=self._unittest_base_path)
+        QEConfig.instance = None
+        try:
+            q = QEConfig(SimpleConfig({'electrum_path': electrum_path}))
+        finally:
+            QEConfig.instance = self.q
+        changes = []
+        q.gossipBackgroundSyncChanged.connect(lambda: changes.append(1))
+        self.assertTrue(q.gossipBackgroundSync)
+        self.assertEqual(120, q.gossipBackgroundSyncInterval)
+        self.assertTrue(q.gossipBackgroundSyncUnmeteredOnly)
+        self.assertFalse(q.gossipBackgroundSyncChargingOnly)
+        q.gossipBackgroundSync = False
+        q.gossipBackgroundSyncInterval = 240
+        q.gossipBackgroundSyncUnmeteredOnly = False
+        q.gossipBackgroundSyncChargingOnly = True
+        self.assertEqual(4, len(changes))  # each one changes the schedule of the job
+        config = q.config
+        self.assertFalse(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC)
+        self.assertEqual(240, config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_INTERVAL)
+        self.assertFalse(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_UNMETERED_ONLY)
+        self.assertTrue(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_CHARGING_ONLY)
+        # whether we asked the user about the battery optimizations is remembered, and is not a setting of the job
+        asked = []
+        q.gossipBackgroundSyncBatteryAskedChanged.connect(lambda: asked.append(1))
+        self.assertFalse(q.gossipBackgroundSyncBatteryAsked)
+        q.gossipBackgroundSyncBatteryAsked = True
+        self.assertTrue(config.LIGHTNING_GOSSIP_BACKGROUND_SYNC_BATTERY_ASKED)
+        self.assertEqual([1], asked)
+        self.assertEqual(4, len(changes))
+
+    def test_write_logs_to_disk(self):
+        from electrum import logging as electrum_logging
+        if electrum_logging.get_logfile_path() is not None:
+            self.skipTest('the test process writes logs to a file already')
+        electrum_path = tempfile.mkdtemp(prefix="electrum-unittest-logs-", dir=self._unittest_base_path)
+        QEConfig.instance = None
+        try:
+            q = QEConfig(SimpleConfig({'electrum_path': electrum_path}))
+        finally:
+            QEConfig.instance = self.q
+        self.addCleanup(electrum_logging.set_file_logging, q.config, False)
+        changes = []
+        q.writeLogsToDiskChanged.connect(lambda: changes.append(q.logsAreWrittenToDisk))
+        self.assertFalse(q.writeLogsToDisk)
+        self.assertFalse(q.logsAreWrittenToDisk)
+        q.writeLogsToDisk = True
+        self.assertTrue(q.config.WRITE_LOGS_TO_DISK)
+        self.assertTrue(q.logsAreWrittenToDisk)  # at once, not at the next start
+        self.assertTrue(os.path.exists(electrum_logging.get_logfile_path()))
+        q.writeLogsToDisk = False
+        self.assertFalse(q.config.WRITE_LOGS_TO_DISK)
+        self.assertFalse(q.logsAreWrittenToDisk)
+        self.assertEqual([True, False], changes)  # (what the GUI reads when it is told)

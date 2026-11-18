@@ -637,13 +637,15 @@ class HtlcLog(NamedTuple):
             failure_msg = self.failure_msg
             if sender_idx is not None:
                 try:
-                    short_channel_id = route[sender_idx + 1].short_channel_id
+                    edge = route[sender_idx + 1]
+                    short_channel_id = getattr(edge, 'onion_short_channel_id', None) or edge.short_channel_id
                 except IndexError:
                     # payment destination reported error
                     short_channel_id = _("Destination node")
             message = failure_msg.code_name()
         else:
-            short_channel_id = route[-1].short_channel_id
+            edge = route[-1]
+            short_channel_id = getattr(edge, 'onion_short_channel_id', None) or edge.short_channel_id
             message = _('Success')
         chan_str = str(short_channel_id) if short_channel_id else _("Unknown")
         return route_str, chan_str, message
@@ -708,6 +710,12 @@ MIN_FINAL_CLTV_DELTA_ACCEPTED = 144
 # buffer added to min_final_cltv_delta of created bolt11 invoices to make verifying the cltv delta
 # of incoming payment htlcs reliable even if some blocks have been mined during forwarding
 MIN_FINAL_CLTV_DELTA_BUFFER_INVOICE = 3
+
+# The same, the other way round: buffer added to the min_final_cltv_delta of the invoices we pay.
+# Other implementations do not add a buffer to their invoices: a destination that has seen a block more
+# than we have (it was mined while the htlc was on its way, or we have not received it yet) would
+# reject our htlcs as expiring too soon, with incorrect_or_unknown_payment_details.
+MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT = 3
 
 # "the deadline for offered HTLCs": (BOLT-02)
 # "the deadline after which the channel has to be failed and timed out on-chain"

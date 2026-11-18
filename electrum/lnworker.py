@@ -3,6 +3,8 @@
 # file LICENCE or http://www.opensource.org/licenses/mit-license.php
 
 import asyncio
+import json
+import logging
 import os
 from decimal import Decimal
 import random
@@ -14,6 +16,7 @@ from typing import (
 )
 from types import MappingProxyType
 import threading
+import weakref
 import socket
 from functools import partial
 from collections import defaultdict
@@ -73,7 +76,8 @@ from .lnutil import (
     ShortChannelID, HtlcLog, NoPathFound, InvalidGossipMsg, FeeBudgetExceeded, ImportedChannelBackupStorage,
     OnchainChannelBackupStorage, ln_compare_features, IncompatibleLightningFeatures, PaymentFeeBudget,
     NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE, GossipForwardingMessage, MIN_FUNDING_SAT,
-    MIN_FINAL_CLTV_DELTA_BUFFER_INVOICE, RecvMPPResolution, ReceivedMPPStatus, ReceivedMPPHtlc,
+    MIN_FINAL_CLTV_DELTA_BUFFER_INVOICE, MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT, RecvMPPResolution, ReceivedMPPStatus,
+    ReceivedMPPHtlc,
     PaymentSuccess, ChannelType, ChannelConfig, ChannelKeys, Keypair, ZEROCONF_TIMEOUT,
 )
 from .lnonion import (
@@ -83,7 +87,7 @@ from .lnonion import (
 from .lnmsg import decode_msg
 from .lnrouter import (
     RouteEdge, LNPaymentRoute, LNPaymentPath, is_route_within_budget, NoChannelPolicy,
-    LNPathInconsistent, fee_for_edge_msat,
+    LNPathInconsistent, fee_for_edge_msat, local_scid_for_route_hint, LNPathFinder, LiquidityHintMgr,
 )
 from .lnwatcher import LNWatcher
 from .submarine_swaps import SwapManager
@@ -250,6 +254,7 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.network = None  # type: Optional[Network]
         self.config = config
         self.stopping_soon = False  # whether we are being shut down
+        self.paused = False  # whether to refrain from connecting to peers, see LNGossip.pause()
         self.register_callbacks()
 
     def diagnostic_name(self):
@@ -331,6 +336,8 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
             await asyncio.sleep(1)
             if self.stopping_soon:
                 return
+            if self.paused:
+                continue
             now = time.time()
             if len(self._peers) >= NUM_PEERS_TARGET:
                 continue
@@ -411,7 +418,8 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
 
     def is_our_lnwallet(self, node_id: bytes) -> bool:
         """Check if node_id is one of our own wallets"""
-        wallets = self.network.daemon.get_wallets()
+        daemon = self.network.daemon
+        wallets = daemon.get_wallets() if daemon else {}  # there is no daemon when only catching up on gossip
         for wallet in wallets.values():
             if wallet.lnworker and wallet.lnworker.node_keypair.pubkey == node_id:
                 return True
@@ -517,12 +525,14 @@ class LNPeerManager(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
 
         # getting desperate... let's try hardcoded fallback list of peers
         fallback_list = constants.net.FALLBACK_LN_NODES
-        fallback_list = [peer for peer in fallback_list if self._can_retry_addr(peer, now=now)]
+        fallback_list = [peer for peer in fallback_list if self._can_retry_addr(peer, now=now)
+                         and not self.channel_db.is_avoided_peer(peer.pubkey)]
         if fallback_list:
             return [random.choice(fallback_list)]
 
         # last resort: try dns seeds (BOLT-10)
-        return await self._get_peers_from_dns_seeds()
+        return [peer for peer in await self._get_peers_from_dns_seeds()
+                if not self.channel_db.is_avoided_peer(peer.pubkey)]
 
     async def _get_peers_from_dns_seeds(self) -> Sequence[LNPeerAddr]:
         # Return several peers to reduce the number of dns queries.
@@ -662,6 +672,71 @@ class LNGossip(Logger):
     independently of the active LNWallets. LNGossip keeps a curated batch of gossip in _forwarding_gossip
     that is fetched by the LNWallets for regular forwarding."""
     max_age = 14*24*3600
+    # After downtime we ask some of our peers to resend the gossip we missed (the backlog).
+    # If we recorded until when we had received all the gossip, the backlog starts shortly before
+    # that, as updates take a while to reach our peers. A db without that record only tells us
+    # its newest update, and a session that got interrupted early has fresh updates but not the
+    # older ones, so there the margin is larger.
+    GOSSIP_SYNCED_MARGIN = 20 * 60  # seconds
+    GOSSIP_BACKLOG_MARGIN = 2 * 3600  # seconds
+    # peers mostly resend the same updates, so limit how many of them we ask, to save traffic
+    GOSSIP_BACKLOG_NUM_PEERS = 2
+    # A peer takes minutes to resend the gossip of a day or more (lnd sends about 200 messages
+    # per second), and a mobile OS only lets us run for a few minutes in the background. So we ask
+    # for a long backlog in parts, oldest first, and record how far we got after each: if we get
+    # interrupted, we go on from there the next time. A part is the older half of what is left,
+    # as most channels get updated at least daily, so most of the backlog is recent.
+    GOSSIP_BACKLOG_LAST_PART_MAX_DURATION = 6 * 3600  # seconds
+    # There is no message that marks the end of the backlog. We consider it received from a peer
+    # once that peer sends as little as the peers that only relay new gossip, and has answered a
+    # ping that we sent when it started to send little: a connection that stalled is quiet as well.
+    GOSSIP_SYNC_TICK = 10  # seconds
+    GOSSIP_CATCH_UP_QUIET_TICKS = 3
+    GOSSIP_CATCH_UP_QUIET_RATE = 20  # messages per second, from a single peer
+    GOSSIP_BACKLOG_PONG_TIMEOUT = LN_P2P_NETWORK_TIMEOUT  # seconds
+    # Not every peer resends old gossip (LDK does not if we ask for less than six hours). A peer
+    # that got quiet without having sent this many old updates does not count, and we ask another.
+    # (the number that applies is lower if few updates are to be expected, see _min_gossip_backlog_updates)
+    GOSSIP_BACKLOG_MIN_UPDATES = 100
+    # Peers that do resend old gossip start within seconds, at hundreds of messages per second.
+    # A peer that by then sent less than a tenth of the minimum, but other messages, will not:
+    # no need to wait for it to get quiet.
+    GOSSIP_BACKLOG_START_TIMEOUT = 15  # seconds
+    # Once a peer has sent the backlog, another one that is still sending is likely sending much
+    # more than we asked for, at a low rate. We do not wait for it longer than this, and disconnect,
+    # to save traffic. After this time we also do not ask further peers.
+    GOSSIP_BACKLOG_GRACE_TIME = 60  # seconds
+    # A peer that ignores the time span we ask for sends its whole graph (LDK does, if we ask for
+    # more than the last six hours), which takes it a quarter of an hour. lnd also sends updates
+    # we did not ask for, the other direction of the channels that got updated, but not this many.
+    GOSSIP_BACKLOG_MIN_UPDATES_NOT_ASKED_FOR = 2000
+    # A peer that announces this many channels we pruned, without a policy that is not expired, gets dropped.
+    GOSSIP_MAX_PRUNED_CHANS_ANNOUNCED = 300
+    GOSSIP_BACKLOG_MAX_RATIO_NOT_ASKED_FOR = 4
+    # a tick that is this late means that the process or the device was suspended
+    GOSSIP_SUSPEND_THRESHOLD = 60  # seconds
+    # On a network with many channels there is always new gossip. If none arrives for this long,
+    # our peers do not relay it, and we look for others.
+    GOSSIP_MAX_SILENCE = 5 * 60  # seconds
+    GOSSIP_SYNCED_UNTIL_SAVE_INTERVAL = 60  # seconds
+    # Peers disagree a lot about which channels exist, and channels only leave our db once their
+    # policies are old. We consider a channel gone if fewer than a majority of peers still list it.
+    CHANNEL_RANGE_NUM_PEERS = NUM_PEERS_TARGET
+    CHANNEL_RANGE_MIN_PEER_COVERAGE = 0.9  # peers that do not know this share of our channels do not vote
+    CHANNEL_RANGE_MIN_CHANNEL_AGE = 144  # blocks. a new channel might not have reached all peers yet
+    # A channel that got updated shortly before our newest policy is likely alive. Only a few hours, as
+    # channels often get updated shortly before they are closed, and peers forget them after 12 blocks.
+    CHANNEL_RANGE_RECENT_POLICY_AGE = 3 * 3600
+    # if our newest policy is older than this, we were offline for long, and we do not remove anything
+    CHANNEL_RANGE_FRESH_DB_AGE = 24 * 3600
+    CHANNEL_RANGE_MAX_REMOVED_FRACTION = 0.1  # sanity check, against peers with a broken view
+    # A channel that only one peer lists is mostly one that this peer has not forgotten yet: closed long
+    # ago, or with policies older than max_age, which we would download just to prune it. Peers differ
+    # by thousands here (one listed 55k channels, the others 26k to 36k). So we ask for an unknown
+    # channel of a channel range once this many peers list it...
+    CHANNEL_QUERY_MIN_PEERS = 2
+    # ...unless our db has hardly any channels yet (the first sync), when we take what peers list.
+    CHANNEL_QUERY_FIRST_SYNC_CHANNELS = 1000
 
     def __init__(self, config: 'SimpleConfig'):
         self.config = config
@@ -673,8 +748,44 @@ class LNGossip(Logger):
         self.lnpeermgr = LNPeerManager(node_keypair, features=LNGOSSIP_FEATURES, config=self.config, lnwallet_or_lngossip=self)
         self.taskgroup = OldTaskGroup()
         self.unknown_ids = set()
+        # unknown channels of channel ranges, waiting for more peers to list them -> those peers
+        self._unknown_ids_listed_by = {}  # type: Dict[bytes, Set[bytes]]
         self._forwarding_gossip = []  # type: List[GossipForwardingMessage]
         self._last_gossip_batch_ts = 0  # type: int
+        # until when we have received all the gossip. None if not known (yet)
+        self._gossip_synced_until = None  # type: Optional[int]
+        self._gossip_sync_is_set_up = False  # type: bool
+        self._gossip_catching_up = True  # type: bool
+        self._gossip_catch_up_start = 0.  # type: float
+        # The part of the backlog we are asking peers for: the gossip since _start and before _end.
+        # No _start: there is none to ask for. No _end: it is the last part, followed by the new gossip.
+        self._gossip_backlog_start = None  # type: Optional[int]
+        self._gossip_backlog_end = None  # type: Optional[int]
+        # the peers we asked for this part of the backlog, and when
+        self._gossip_backlog_asked = {}  # type: Dict[Peer, float]
+        # of those, the ones that send little, and when we pinged them for that
+        self._gossip_backlog_pinged = {}  # type: Dict[Peer, float]
+        self._gossip_backlog_done = set()  # type: Set[Peer]  # those that sent it
+        self._gossip_backlog_first_done_time = None  # type: Optional[float]
+        # The nodes that did not send what we asked for, or take too long, since we started
+        # to catch up. We do not ask them again, also not if they reconnect.
+        self._gossip_backlog_useless = set()  # type: Set[bytes]
+        # peer -> (time, number of gossip messages received so far), for the last few ticks
+        self._gossip_rx_samples = {}  # type: Dict[Peer, List[Tuple[float, int]]]
+        self._gossip_last_tick = None  # type: Optional[float]
+        self._gossip_paused = False  # see pause()
+        # when this session started to ask its peers for new gossip, if it had no idea until when it had it
+        self._gossip_news_since = None  # type: Optional[int]
+        self._gossip_last_rx_time = 0.  # type: float  # when we last noticed that gossip arrived
+        self._gossip_num_msgs_received = 0  # type: int
+        self._gossip_synced_until_saved = 0.  # type: float
+        self._num_gossip_msgs_in_processing = 0  # type: int
+        self._channel_range_counts = None  # type: Optional[Dict[ShortChannelID, int]]
+        self._channel_range_max_height = 0  # type: int
+        self._channel_range_db_is_fresh = False  # type: bool
+        self._channel_range_recent_ts = 0  # type: int
+        self._channel_range_peers = set()  # type: Set[bytes]
+        self._channel_range_done = False  # type: bool
         self._forwarding_gossip_lock = asyncio.Lock()
         self.gossip_request_semaphore = asyncio.Semaphore(5)
         # statistics
@@ -682,6 +793,7 @@ class LNGossip(Logger):
         self._num_node_ann = 0
         self._num_chan_upd = 0
         self._num_chan_upd_good = 0
+        self._num_peers_resending_pruned_chans = 0
 
     @property
     def features(self) -> 'LnFeatures':
@@ -713,7 +825,8 @@ class LNGossip(Logger):
         self.lnpeermgr.start_network(network, maintain_random_peers=True)
         for coro in [
                 self.maintain_db(),
-                self._maintain_forwarding_gossip()
+                self._maintain_forwarding_gossip(),
+                self._maintain_gossip_sync(),
         ]:
             tg_coro = self.taskgroup.spawn(coro)
             asyncio.run_coroutine_threadsafe(tg_coro, get_asyncio_loop())
@@ -721,6 +834,11 @@ class LNGossip(Logger):
     async def stop(self):
         await self.lnpeermgr.stop()
         await self.taskgroup.cancel_remaining()
+        if self.channel_db and self._gossip_sync_is_set_up:
+            if saved := self._save_gossip_synced_until(force=True):
+                # the db drops the writes that are still queued when it gets stopped
+                async with ignore_after(5):
+                    await saved
 
     async def maintain_db(self):
         await self.channel_db.data_loaded.wait()
@@ -746,15 +864,487 @@ class LNGossip(Logger):
         async with self._forwarding_gossip_lock:
             return self._forwarding_gossip, self._last_gossip_batch_ts
 
-    async def add_new_ids(self, ids: Iterable[bytes]):
+    def _set_up_gossip_sync(self) -> None:
+        """Decides what to catch up on, once the db is loaded."""
+        if self._gossip_sync_is_set_up:
+            return
+        self._gossip_sync_is_set_up = True
+        synced_until = self.channel_db.synced_until_at_load
+        if synced_until is not None:
+            synced_until = min(synced_until, int(time.time()))
+        self._gossip_synced_until = synced_until
+        self._start_gossip_catch_up()
+
+    def _start_gossip_catch_up(self) -> None:
+        now = int(time.time())
+        if self._gossip_synced_until is not None:
+            start = self._gossip_synced_until - self.GOSSIP_SYNCED_MARGIN
+        elif (latest_ts := self.channel_db.latest_policy_ts_at_load) is not None:
+            start = latest_ts - self.GOSSIP_BACKLOG_MARGIN
+        elif self._gossip_news_since is not None:
+            # The db had no policies, and the first catch-up got interrupted (a suspend, a pause):
+            # the channels we fetched since then are known now, so their updates have to be asked for.
+            start = self._gossip_news_since - self.GOSSIP_SYNCED_MARGIN
+        else:
+            # no policies: the channels get queried in full, as they are not known
+            start = None
+            self._gossip_news_since = now
+        if start is not None:
+            start = min(max(start, now - self.max_age), now)
+        self._gossip_backlog_useless = set()
+        self._set_gossip_backlog_part(start)
+        self._gossip_catching_up = True
+        self._gossip_catch_up_start = time.time()
+
+    def _set_gossip_backlog_part(self, start: Optional[int]) -> None:
+        """Sets the part of the backlog to ask peers for next, which begins at `start`."""
+        end = None
+        if start is not None:
+            duration = int(time.time()) - start
+            if duration > self.GOSSIP_BACKLOG_LAST_PART_MAX_DURATION:
+                end = start + duration // 2
+        self._gossip_backlog_start = start
+        self._gossip_backlog_end = end
+        self._gossip_backlog_asked = {}
+        self._gossip_backlog_pinged = {}
+        self._gossip_backlog_done = set()
+        self._gossip_backlog_first_done_time = None
+
+    def _ask_for_gossip_backlog(self, peer: 'Peer', now: float) -> Tuple[int, int]:
+        """Notes that we ask the peer for the current part of the backlog.
+        Returns the first_timestamp and timestamp_range for its gossip_timestamp_filter."""
+        self._gossip_backlog_asked[peer] = now
+        self._gossip_backlog_pinged.pop(peer, None)
+        self._gossip_rx_samples.pop(peer, None)  # what it sent before says nothing about the backlog
+        start, end = self._gossip_backlog_start, self._gossip_backlog_end
+        return start, (end - start if end is not None else 0xFFFFFFFF)
+
+    def _gossip_peers(self) -> List['Peer']:
+        """Returns the peers that send us gossip."""
+        return [peer for peer in self.lnpeermgr.peers.values() if peer.our_gossip_timestamp_filter is not None]
+
+    def _should_ask_for_gossip_backlog(self, peer: 'Peer', peers: Iterable['Peer'], now: float) -> bool:
+        """Whether to ask the peer for the backlog, `peers` being the ones that send us gossip."""
+        if not self._gossip_catching_up or self._gossip_backlog_start is None:
+            return False
+        if peer in self._gossip_backlog_asked or peer.pubkey in self._gossip_backlog_useless:
+            return False
+        first_done_time = self._gossip_backlog_first_done_time
+        if first_done_time is not None and now - first_done_time >= self.GOSSIP_BACKLOG_GRACE_TIME:
+            return False  # we have the backlog from one peer, and waited long enough for a second one
+        # the peers that are sending the backlog or have sent it
+        sources = [p for p in peers if p in self._gossip_backlog_asked and p.pubkey not in self._gossip_backlog_useless]
+        return len(sources) < self.GOSSIP_BACKLOG_NUM_PEERS  # more peers would mostly resend the same
+
+    def get_gossip_timestamp_filter(self, peer: 'Peer') -> Tuple[int, int]:
+        """Returns the first_timestamp and timestamp_range of the gossip_timestamp_filter for a new peer.
+
+        `get_ids_to_query` only requests channels we do not know about yet, so without asking
+        for the backlog the policies of known channels stay stale after being offline, until
+        they happen to change again.
+        """
+        self._set_up_gossip_sync()
+        now = time.time()
+        if not self._should_ask_for_gossip_backlog(peer, self._gossip_peers(), now):
+            return int(now), 0xFFFFFFFF
+        return self._ask_for_gossip_backlog(peer, now)
+
+    def pause(self) -> None:
+        """Disconnects from the peers, and stays without gossip until resume(). The db and the path finder
+        go on as they are.
+
+        For a mobile app in the background: some systems suspend it, others let it run for hours, and then
+        the gossip would go on arriving for as long, also on a metered network.
+        To be called from the event loop."""
+        if self._gossip_paused:
+            return
+        self._gossip_paused = True
+        self.lnpeermgr.paused = True
+        self.logger.info("pausing gossip")
+        if self._gossip_sync_is_set_up:
+            if not self._gossip_catching_up:
+                self._advance_gossip_synced_until()
+            self._save_gossip_synced_until(force=True)
+        self._close_peers_while_paused()
+
+    def resume(self) -> None:
+        """Connects to peers again, and catches up on the gossip missed since pause().
+        To be called from the event loop."""
+        if not self._gossip_paused:
+            return
+        self._gossip_paused = False
+        self.lnpeermgr.paused = False
+        self.logger.info("resuming gossip")
+        if self._gossip_sync_is_set_up:
+            self._gossip_rx_samples = {}
+            self._start_gossip_catch_up()
+
+    def is_paused(self) -> bool:
+        return self._gossip_paused
+
+    def _close_peers_while_paused(self) -> None:
+        for peer in list(self.lnpeermgr.peers.values()):
+            peer.close_and_cleanup()
+
+    def is_caught_up(self) -> bool:
+        """Whether we received the gossip we missed while offline, and are now getting the new one."""
+        if not self._gossip_sync_is_set_up or self._gossip_catching_up or self._gossip_paused:
+            return False
+        # if the tick is overdue then we were suspended, which the tick will notice in a moment
+        last_tick = self._gossip_last_tick
+        return last_tick is not None and time.time() - last_tick <= self.GOSSIP_SYNC_TICK + self.GOSSIP_SUSPEND_THRESHOLD
+
+    def get_gossip_synced_until(self) -> Optional[int]:
+        """Returns until when we have received all the gossip, if we know."""
+        return self._gossip_synced_until
+
+    async def _maintain_gossip_sync(self):
+        await self.channel_db.data_loaded.wait()
+        self._set_up_gossip_sync()
+        while True:
+            await asyncio.sleep(self.GOSSIP_SYNC_TICK)
+            try:
+                self._gossip_sync_tick()
+            except Exception:
+                # we share the taskgroup with the maintenance of the db
+                self.logger.exception("gossip sync tick failed")
+
+    def _gossip_sync_tick(self) -> None:
+        now = time.time()
+        last_tick, self._gossip_last_tick = self._gossip_last_tick, now
+        if self._gossip_paused:
+            # a connection that was being made when we got paused might have been established since
+            self._close_peers_while_paused()
+            return
+        peers = self._gossip_peers()
+        num_samples = self.GOSSIP_CATCH_UP_QUIET_TICKS + 1
+        self._gossip_rx_samples = {
+            peer: (self._gossip_rx_samples.get(peer, []) + [(now, peer.num_gossip_msgs_received)])[-num_samples:]
+            for peer in peers}
+        num_msgs_received = self._num_chan_ann + self._num_node_ann + self._num_chan_upd
+        if num_msgs_received != self._gossip_num_msgs_received:
+            self._gossip_num_msgs_received = num_msgs_received
+            self._gossip_last_rx_time = now
+        if last_tick is not None and now - last_tick > self.GOSSIP_SYNC_TICK + self.GOSSIP_SUSPEND_THRESHOLD:
+            # While we slept the peers likely disconnected, and what they sent meanwhile is lost.
+            self.logger.info(f"woke up after {now - last_tick:.0f} seconds. catching up on gossip")
+            self._gossip_rx_samples = {}
+            self._start_gossip_catch_up()
+        elif not self._gossip_catching_up:
+            if not peers:
+                self.logger.info("lost all gossip peers. will catch up on gossip")
+            elif (now - self._gossip_last_rx_time > self.GOSSIP_MAX_SILENCE
+                    and self.channel_db.num_policies >= 100 * self.GOSSIP_BACKLOG_MIN_UPDATES):
+                self.logger.info("no gossip from our peers for a while. will catch up on gossip")
+            elif (self._gossip_synced_until is not None and min(
+                    peer.our_gossip_timestamp_filter.first_timestamp for peer in peers)
+                    > max(self._gossip_synced_until, int(self._gossip_last_rx_time)) + 2 * self.GOSSIP_SYNC_TICK):
+                # E.g. the connections died without closing, and each got replaced by a peer that relays
+                # only new gossip, but not before the next one connected: no tick saw that we had none.
+                self.logger.info("our gossip peers all connected after we last had gossip. will catch up on gossip")
+            else:
+                # (not "now": the peers might have stopped relaying gossip)
+                self._advance_gossip_synced_until()
+                self._save_gossip_synced_until()
+                return
+            self._start_gossip_catch_up()
+        self._update_gossip_backlog_peers(now, peers)
+        if not self._is_gossip_backlog_received():
+            return
+        if self._gossip_backlog_end is not None:
+            # that was a part of it. the peers that sent it get to send the next part
+            self._gossip_synced_until = self._gossip_backlog_end
+            self._save_gossip_synced_until(force=True)
+            sources = [peer for peer in peers if peer in self._gossip_backlog_done]
+            self._set_gossip_backlog_part(self._gossip_backlog_end)
+            for peer in sources:
+                self._request_gossip_backlog(peer, now)
+            return
+        self._gossip_catching_up = False
+        # (not "now": other things than the backlog can have held us up, with no gossip arriving)
+        self._advance_gossip_synced_until()
+        self._save_gossip_synced_until(force=True)
+        self.logger.info(f"caught up on gossip in {now - self._gossip_catch_up_start:.0f} seconds")
+
+    def _advance_gossip_synced_until(self) -> None:
+        """We have the gossip up to the time it last arrived."""
+        last_rx_time = int(self._gossip_last_rx_time)
+        if last_rx_time > (self._gossip_synced_until or 0):
+            self._gossip_synced_until = last_rx_time
+
+    def _gossip_rx_rate(self, peer: 'Peer', *, num_ticks: int = None) -> Optional[float]:
+        """Returns the number of gossip messages per second the peer sent over the last few ticks."""
+        if num_ticks is None:
+            num_ticks = self.GOSSIP_CATCH_UP_QUIET_TICKS
+        samples = self._gossip_rx_samples.get(peer, [])
+        if len(samples) <= num_ticks:
+            return None
+        (t0, n0), (t1, n1) = samples[-num_ticks - 1], samples[-1]
+        return (n1 - n0) / max(t1 - t0, 1)
+
+    def _min_gossip_backlog_updates(self, now: float) -> int:
+        """Returns how many old updates a peer has to send for the current part of the backlog,
+        for us to believe that it does resend old gossip."""
+        start, end = self._gossip_backlog_start, self._gossip_backlog_end
+        if start is None:
+            return 0
+        # the updates that are too old to be news, see Peer.GOSSIP_NEWS_MAX_AGE
+        end = min(end if end is not None else now, now - Peer.GOSSIP_NEWS_MAX_AGE)
+        # Peers resend the updates that are the newest of their channel. Most nodes refresh the
+        # updates of their channels daily (lnd does), so most of those are from the last day:
+        # on mainnet three quarters of the policies. We reckon with half.
+        last_day_start = now - 24 * 3600
+        num_expected = self.channel_db.num_policies / 2 * max(end - max(start, last_day_start), 0) / (24 * 3600)
+        # The rest is older, up to max_age, after which we drop a policy. On mainnet a time span of
+        # some days ago had a fifth of what an even spread of all policies over max_age would give.
+        num_expected += self.channel_db.num_policies / 5 * max(min(end, last_day_start) - start, 0) / self.max_age
+        # a tenth of that is not too much to ask for
+        return min(self.GOSSIP_BACKLOG_MIN_UPDATES, int(num_expected / 10))
+
+    def _update_gossip_backlog_peers(self, now: float, peers: Sequence['Peer']) -> None:
+        """Checks how the peers we asked for the backlog are doing, and asks others if needed."""
+        min_updates = self._min_gossip_backlog_updates(now)
+        first_done_time = self._gossip_backlog_first_done_time
+        for peer in peers:
+            if not self._is_sending_gossip_backlog(peer):
+                continue
+            rate = self._gossip_rx_rate(peer)
+            asked_time = self._gossip_backlog_asked[peer]
+            num_updates = peer.num_gossip_backlog_updates_received
+            num_not_asked_for = peer.num_gossip_updates_not_asked_for
+            is_quiet = rate is not None and rate <= self.GOSSIP_CATCH_UP_QUIET_RATE
+            # Once it is quiet: has it sent everything, or did the connection stall? A pong will tell.
+            # We ping as soon as it sends little, to have the pong by the time we call it quiet.
+            last_rate = self._gossip_rx_rate(peer, num_ticks=1)
+            if last_rate is None or last_rate > self.GOSSIP_CATCH_UP_QUIET_RATE:
+                self._gossip_backlog_pinged.pop(peer, None)
+            elif peer not in self._gossip_backlog_pinged:
+                self._gossip_backlog_pinged[peer] = now
+                try:
+                    peer.send_ping()
+                except Exception as e:
+                    self.logger.info(f"could not ping {peer.pubkey.hex()[:10]}: {e!r}")
+            reason = None
+            if peer.is_querying_short_channel_ids:
+                pass  # its updates are not counted meanwhile, as replies to queries contain old ones
+            elif (10 * num_updates < min_updates and now - asked_time >= self.GOSSIP_BACKLOG_START_TIMEOUT
+                    and peer.last_message_time > asked_time):
+                # (not just zero: the odd update that arrives as news is old enough to be counted)
+                reason = "does not send the gossip backlog we asked for"
+            elif (num_not_asked_for >= self.GOSSIP_BACKLOG_MIN_UPDATES_NOT_ASKED_FOR
+                    and num_not_asked_for > self.GOSSIP_BACKLOG_MAX_RATIO_NOT_ASKED_FOR * num_updates):
+                reason = "sends gossip we did not ask for, instead of the backlog. disconnecting"
+            elif not is_quiet:  # still sending
+                waiting_since = max(first_done_time or now, asked_time)
+                if now - waiting_since >= self.GOSSIP_BACKLOG_GRACE_TIME:
+                    reason = "takes too long to send the gossip backlog. disconnecting"
+            elif peer not in self._gossip_backlog_pinged:
+                pass  # it sent little over the last ticks, but not in the last one. not quiet after all
+            elif peer.last_pong_time < self._gossip_backlog_pinged[peer]:
+                if now - self._gossip_backlog_pinged[peer] >= self.GOSSIP_BACKLOG_PONG_TIMEOUT:
+                    # the connection is dead, which says nothing about what the node would send
+                    self.logger.info(f"{peer.pubkey.hex()[:10]} does not respond. disconnecting")
+                    del self._gossip_backlog_asked[peer]  # so that another peer gets asked right away
+                    peer.close_and_cleanup()
+            elif num_updates >= min_updates:
+                self._gossip_backlog_done.add(peer)
+                if self._gossip_backlog_first_done_time is None:
+                    self._gossip_backlog_first_done_time = now
+            else:
+                reason = "did not send the gossip backlog we asked for"
+            if reason:
+                self.logger.info(f"{peer.pubkey.hex()[:10]} {reason}")
+                self._gossip_backlog_useless.add(peer.pubkey)
+                if reason.endswith("disconnecting"):
+                    peer.close_and_cleanup()
+                elif self._gossip_backlog_end is not None:
+                    # we asked it for a time span in the past. let it send the new gossip
+                    self._request_gossip(peer, int(now))
+        # Ask the peers that are already connected, as they will not get replaced by new ones.
+        # (also after a suspend: if a connection is dead, the peer is gone by one of the next ticks)
+        peers = [peer for peer in peers if peer in self.lnpeermgr.peers.values()]  # not those dropped above
+        for peer in peers:
+            # (not during a query for channels: the reply consists of old gossip as well)
+            if not peer.is_querying_short_channel_ids and self._should_ask_for_gossip_backlog(peer, peers, now):
+                self._request_gossip_backlog(peer, now)
+        if (peers and self._gossip_catching_up and self._gossip_backlog_start is not None
+                and not self._gossip_backlog_done and len(self.lnpeermgr.peers) >= NUM_PEERS_TARGET
+                and all(peer.pubkey in self._gossip_backlog_useless for peer in peers)):
+            # None of our peers resends old gossip, and we do not connect to more peers while we
+            # have enough of them. Make room for one. (peers that connect are asked right away)
+            self.logger.info("no peer sent the gossip backlog. disconnecting from one of them")
+            peers[0].close_and_cleanup()
+        if self.logger.isEnabledFor(logging.DEBUG) and self._gossip_catching_up:
+            def state(peer):
+                if peer in self._gossip_backlog_done:
+                    return ' done'
+                if peer.pubkey in self._gossip_backlog_useless:
+                    return ' useless'
+                return ' asked' if peer in self._gossip_backlog_asked else ''
+            self.logger.debug("catching up on gossip. peers (msgs/s, old updates): " + ', '.join(
+                f"{peer.pubkey.hex()[:6]} {'?' if (rate := self._gossip_rx_rate(peer)) is None else round(rate)} "
+                f"{peer.num_gossip_backlog_updates_received}{state(peer)}"
+                for peer in peers) + f". unknown_ids={len(self.unknown_ids)}")
+
+    def on_channel_announced(self, peer: 'Peer', short_channel_id: bytes) -> bool:
+        """Returns whether to disconnect from the peer.
+
+        Some nodes answer a gossip_timestamp_filter with the announcements of all the channels they
+        have no recent policy for: thousands of them, megabytes, and again every time we ask. Those are
+        the channels we pruned (see ChannelDB.prune_orphaned_channels), and we drop them again as they
+        arrive (see process_gossip). The nodes we saw sending a channel with its policies (lnd) send
+        them right after the announcement, so the channels that wait for one do not add up for them.
+        (A node that sent hundreds of announcements first, of channels that came back to life, and
+        their policies only after, would be taken for the former.)
+        """
+        if not self.channel_db.is_recently_orphaned(short_channel_id):
+            return False
+        peer.pruned_chans_announced.add(short_channel_id)
+        if len(peer.pruned_chans_announced) < self.GOSSIP_MAX_PRUNED_CHANS_ANNOUNCED:
+            return False
+        self.logger.info(f"{peer.pubkey.hex()[:10]} resends the channels without a recent policy that we pruned. "
+                         f"disconnecting")
+        self._num_peers_resending_pruned_chans += 1
+        self._gossip_backlog_useless.add(peer.pubkey)  # not to be asked for the backlog if it connects again
+        self.channel_db.avoid_peer(peer.pubkey)  # it would do the same the next time
+        return True
+
+    def on_channel_update_of_announced(self, peer: 'Peer', payload: dict) -> None:
+        """A policy that is not expired, for a channel we pruned that the peer announced: the channel is alive."""
+        if time.time() - payload['timestamp'] <= self.max_age:
+            peer.pruned_chans_announced.discard(payload['short_channel_id'])
+
+    def _is_sending_gossip_backlog(self, peer: 'Peer') -> bool:
+        """Whether we asked the peer for this part of the backlog and still wait for it."""
+        return (peer in self._gossip_backlog_asked and peer not in self._gossip_backlog_done
+                and peer.pubkey not in self._gossip_backlog_useless)
+
+    def _request_gossip(self, peer: 'Peer', first_timestamp: int, timestamp_range: int = 0xFFFFFFFF) -> None:
+        """Sends a new gossip_timestamp_filter to a peer that is connected already."""
+        try:
+            peer.request_gossip(first_timestamp, timestamp_range)
+        except Exception as e:
+            self.logger.info(f"could not send a gossip_timestamp_filter to {peer.pubkey.hex()[:10]}: {e!r}")
+
+    def _request_gossip_backlog(self, peer: 'Peer', now: float) -> None:
+        """Asks a peer that is connected already for the current part of the backlog."""
+        self._request_gossip(peer, *self._ask_for_gossip_backlog(peer, now))
+
+    def _is_gossip_backlog_received(self) -> bool:
+        peers = self._gossip_peers()
+        # (Without peers this can hold as well, if one of them had sent the backlog. The next tick
+        # then finds that we have no peers, and we catch up from the time gossip last arrived.)
+        if any(peer.is_querying_short_channel_ids for peer in peers):
+            return False  # fetching channels we did not know of
+        if self.unknown_ids and any(peer.answers_channel_queries for peer in peers):
+            return False
+        # (not zero: there are always some new messages waiting for the next batch)
+        num_msgs_to_process = self._num_gossip_msgs_in_processing + sum(peer.recv_gossip_queue.qsize() for peer in peers)
+        if num_msgs_to_process > self.GOSSIP_CATCH_UP_QUIET_RATE * self.GOSSIP_SYNC_TICK:
+            return False
+        if self._gossip_backlog_start is not None:
+            # a peer has sent it, and no other peer is still sending it
+            return bool(self._gossip_backlog_done) and not any(self._is_sending_gossip_backlog(peer) for peer in peers)
+        # Nothing to ask for: the db is new, and we fetch all the channels by their ids.
+        # A peer that just connected needs a moment to tell us which channels exist.
+        return any(self._gossip_rx_rate(peer) is not None for peer in peers)
+
+    def _save_gossip_synced_until(self, *, force: bool = False) -> Optional[asyncio.Future]:
+        if self._gossip_synced_until is None:
+            return None
+        now = time.time()
+        if not force and now - self._gossip_synced_until_saved < self.GOSSIP_SYNCED_UNTIL_SAVE_INTERVAL:
+            return None
+        self._gossip_synced_until_saved = now
+        return self.channel_db.save_synced_until(self._gossip_synced_until)
+
+    async def on_channel_range_reply(self, peer_node_id: bytes, ids: Iterable[bytes]) -> None:
+        """Removes the channels listed by fewer than a majority of the first few peers of this session.
+
+        The decision is taken only once per session, so that further peers do not move the bar.
+        Only channels we already know of when the first reply arrives are considered. Channels updated
+        shortly before our newest policy are kept, and nothing gets removed if we were offline for long.
+        """
+        if self._channel_range_done or peer_node_id in self._channel_range_peers:
+            return
+        if self._channel_range_counts is None:
+            self._channel_range_counts = {scid: 0 for scid in self.channel_db.get_channel_ids()}
+            self._channel_range_max_height = self.network.get_local_height() - self.CHANNEL_RANGE_MIN_CHANNEL_AGE
+            latest_ts = self.channel_db.latest_policy_ts_at_load
+            self._channel_range_db_is_fresh = (
+                latest_ts is not None and latest_ts > int(time.time()) - self.CHANNEL_RANGE_FRESH_DB_AGE)
+            # relative to our newest policy when the db was loaded, before gossip or failed payments
+            # of this session could add newer ones
+            self._channel_range_recent_ts = (latest_ts or 0) - self.CHANNEL_RANGE_RECENT_POLICY_AGE
+        counts = self._channel_range_counts
+        ids = set(ids)
+        listed = [short_channel_id for short_channel_id in counts if short_channel_id in ids]
+        if len(listed) < self.CHANNEL_RANGE_MIN_PEER_COVERAGE * len(counts):
+            self.logger.info(f"peer lists only {len(listed)} of our {len(counts)} channels. ignoring its channel range")
+            return
+        self._channel_range_peers.add(peer_node_id)
+        for short_channel_id in listed:
+            counts[short_channel_id] += 1
+        if len(self._channel_range_peers) < self.CHANNEL_RANGE_NUM_PEERS:
+            return
+        self._channel_range_done = True
+        self._channel_range_counts = None
+        if not self._channel_range_db_is_fresh:
+            return
+        majority = self.CHANNEL_RANGE_NUM_PEERS // 2 + 1
+        recent_ts = self._channel_range_recent_ts
+        absent = {
+            short_channel_id for short_channel_id, count in counts.items()
+            if count < majority
+            and short_channel_id.block_height <= self._channel_range_max_height
+            and not self.channel_db.has_policy_newer_than(short_channel_id, recent_ts)
+        }
+        if len(absent) > self.CHANNEL_RANGE_MAX_REMOVED_FRACTION * len(counts):
+            self.logger.warning(f"not removing {len(absent)} of {len(counts)} channels absent from peers: too many")
+            return
+        if absent:
+            await run_in_thread(partial(self.channel_db.remove_channels_absent_from_peers, absent))
+
+    async def add_new_ids(
+            self, ids: Iterable[bytes], *, skip_recently_orphaned: bool = False,
+            listed_by: Optional[bytes] = None,
+    ):
+        """Adds the channels we do not know to the ones to query. listed_by: the peer whose channel range
+        lists them; these are queried once CHANNEL_QUERY_MIN_PEERS peers list them."""
         known = self.channel_db.get_channel_ids()
         new = set(ids) - set(known)
+        if skip_recently_orphaned:
+            new -= self.channel_db.get_recently_orphaned_channel_ids()
+        if listed_by is not None and self.channel_db.num_usable_channels >= self.CHANNEL_QUERY_FIRST_SYNC_CHANNELS:
+            listed = self._unknown_ids_listed_by
+            for short_channel_id in [scid for scid in listed if scid in known]:
+                del listed[short_channel_id]  # we learned of it otherwise
+            confirmed = set()
+            for short_channel_id in new:
+                peers = listed.setdefault(short_channel_id, set())
+                peers.add(listed_by)
+                if len(peers) >= self.CHANNEL_QUERY_MIN_PEERS:
+                    confirmed.add(short_channel_id)
+            for short_channel_id in confirmed:
+                del listed[short_channel_id]
+            new = confirmed
         self.unknown_ids.update(new)
         util.trigger_callback('unknown_channels', len(self.unknown_ids))
         util.trigger_callback('gossip_peers', self.lnpeermgr.num_peers())
         util.trigger_callback('ln_gossip_sync_progress')
 
-    def get_ids_to_query(self) -> Sequence[bytes]:
+    def get_ids_to_query(self, peer: 'Peer') -> Sequence[bytes]:
+        """Returns some channels we do not know yet, for the peer to be queried for."""
+        if self._gossip_catching_up:
+            if self._is_sending_gossip_backlog(peer):
+                # we tell that a peer resends old gossip from what it sends, so we do not ask it for more of it
+                return []
+            if peer.pubkey in self._gossip_backlog_useless and any(
+                    other.answers_channel_queries and other.pubkey not in self._gossip_backlog_useless
+                    for other in self._gossip_peers()):
+                # The peers that do not resend old gossip mostly do not answer these queries either,
+                # which holds the channels back until the query times out. Leave them to the others.
+                return []
         N = 500
         l = list(self.unknown_ids)
         self.unknown_ids = set(l[N:])
@@ -797,21 +1387,55 @@ class LNGossip(Logger):
     async def process_gossip(self, chan_anns, node_anns, chan_upds):
         # note: we run in the originating peer's TaskGroup, so we can safely raise here
         #       and disconnect only from that peer
+        num_msgs = len(chan_anns) + len(node_anns) + len(chan_upds)
+        self._num_gossip_msgs_in_processing += num_msgs
+        try:
+            await self._process_gossip(chan_anns, node_anns, chan_upds)
+        finally:
+            self._num_gossip_msgs_in_processing -= num_msgs
+
+    async def _process_gossip(self, chan_anns, node_anns, chan_upds):
         await self.channel_db.data_loaded.wait()
 
         # channel announcements
         def process_chan_anns():
-            for payload in chan_anns:
+            # Peers resend the announcement of every channel that has a new update. Checking the
+            # four signatures of each is most of the work when catching up after being offline.
+            known = self.channel_db.get_channel_ids()
+            new_chan_anns = [payload for payload in chan_anns if payload['short_channel_id'] not in known]
+            # Peers also send the announcements of channels we pruned recently, with the same old policies
+            # (prune_orphaned_channels): we would add them only to prune them again. A channel that got a
+            # fresh policy is alive, and is taken.
+            if new_chan_anns and (recently_orphaned := self.channel_db.get_recently_orphaned_among(
+                    [payload['short_channel_id'] for payload in new_chan_anns])):
+                now = int(time.time())
+                fresh = {
+                    payload['short_channel_id'] for payload in chan_upds
+                    if now - payload['timestamp'] <= self.max_age}
+                new_chan_anns = [
+                    payload for payload in new_chan_anns
+                    if payload['short_channel_id'] not in recently_orphaned or payload['short_channel_id'] in fresh]
+            for payload in new_chan_anns:
                 self.channel_db.verify_channel_announcement(payload)
-            self.channel_db.add_channel_announcements(chan_anns)
+            self.channel_db.add_channel_announcements(new_chan_anns)
         await run_in_thread(process_chan_anns)
 
         # node announcements
         def process_node_anns():
+            valid_node_anns = []
             for payload in node_anns:
-                self.channel_db.verify_node_announcement(payload)
-            self.channel_db.add_node_announcements(node_anns)
-        await run_in_thread(process_node_anns)
+                try:
+                    self.channel_db.verify_node_announcement(payload)
+                except InvalidGossipMsg:
+                    # Not raising: we would lose the channel updates of this batch as well.
+                    # (peers do relay such announcements, e.g. in replies to queries for channels)
+                    continue
+                valid_node_anns.append(payload)
+            self.channel_db.add_node_announcements(valid_node_anns)
+            return len(node_anns) - len(valid_node_anns)
+        num_invalid_node_anns = await run_in_thread(process_node_anns)
+        if num_invalid_node_anns:
+            self.logger.info(f"ignoring {num_invalid_node_anns} node announcements with an invalid signature")
         # channel updates
         categorized_chan_upds = await run_in_thread(partial(
             self.channel_db.add_channel_updates,
@@ -821,6 +1445,8 @@ class LNGossip(Logger):
         if orphaned:
             self.logger.info(f'adding {len(orphaned)} unknown channel ids')
             orphaned_ids = [c['short_channel_id'] for c in orphaned]
+            # (these updates are not expired: the channels are alive, also those we pruned recently)
+            await run_in_thread(partial(self.channel_db.forget_orphaned_channels, orphaned_ids))
             await self.add_new_ids(orphaned_ids)
 
         self._num_chan_ann += len(chan_anns)
@@ -850,10 +1476,38 @@ class LNGossip(Logger):
         return {}
 
 
+def _age_for_log(timestamp: Optional[int], *, now: Optional[int] = None) -> str:
+    if not timestamp:
+        return 'n/a'
+    seconds = max(0, (now or int(time.time())) - timestamp)
+    if seconds < 120:
+        return f'{seconds}s'
+    if seconds < 2 * 3600:
+        return f'{seconds // 60}m'
+    if seconds < 2 * 86400:
+        return f'{seconds // 3600}h'
+    return f'{seconds // 86400}d'
+
+
+def _scid_for_log(edge: 'RouteEdge') -> 'ShortChannelID':
+    """the scid the network knows (a route hint may have a local one, see local_scid_for_route_hint)"""
+    return edge.onion_short_channel_id or edge.short_channel_id
+
+
+def _route_fee_msat(route: 'LNPaymentRoute', amount_msat: int) -> int:
+    """fee for the route, not counting the first channel (ours), as in the onion we create"""
+    amt = amount_msat
+    for edge in reversed(route[1:]):
+        amt += edge.fee_for_edge(amt)
+    return amt - amount_msat
+
+
 class PaySession(Logger):
 
     # how long we wait for another htlc to resolve after receiving a failure for one sent htlc.
     TIMEOUT_WAIT_FOR_NEXT_RESOLVED_HTLC = 0.5
+    FAILED_HTLCS_PER_PENALTY_WEIGHT = 10  # the weight grows by 1 every this many failed htlcs
+    MAX_PENALTY_WEIGHT = 10
 
     def __init__(
             self,
@@ -892,6 +1546,7 @@ class PaySession(Logger):
 
         self._amount_inflight = 0  # what we sent in htlcs (that receiver gets, without fees)
         self._nhtlcs_inflight = 0
+        self.num_failed_htlcs = 0
         self.is_active = True  # is still trying to send new htlcs?
 
     def diagnostic_name(self):
@@ -901,6 +1556,14 @@ class PaySession(Logger):
     @property
     def number_htlcs_inflight(self) -> int:
         return self._nhtlcs_inflight
+
+    def penalty_weight(self) -> float:
+        """Weight of the path finding costs other than fees, i.e. mostly the penalties for unknown liquidity.
+        When cheap paths keep failing, prefer paths with fewer channels of unknown liquidity, even if they
+        cost more: the weight grows by 1 every FAILED_HTLCS_PER_PENALTY_WEIGHT failed htlcs of the payment
+        (each part of a multi-part payment counts). The fee budget still applies.
+        """
+        return min(1 + self.num_failed_htlcs / self.FAILED_HTLCS_PER_PENALTY_WEIGHT, self.MAX_PENALTY_WEIGHT)
 
     def maybe_raise_trampoline_fee(self, htlc_log: HtlcLog):
         if htlc_log.trampoline_fee_level == self.trampoline_fee_level:
@@ -952,6 +1615,8 @@ class PaySession(Logger):
         htlc_log = await self.sent_htlcs_q.get()
         self._amount_inflight -= htlc_log.amount_msat
         self._nhtlcs_inflight -= 1
+        if not htlc_log.success:
+            self.num_failed_htlcs += 1
         if self._amount_inflight < 0 or self._nhtlcs_inflight < 0:
             raise Exception(f"amount_inflight={self._amount_inflight}, nhtlcs_inflight={self._nhtlcs_inflight}. both should be >= 0 !")
         return htlc_log
@@ -1013,6 +1678,10 @@ class LNWallet(Logger):
         self.wallet = wallet
         self.config = wallet.config
         self.db = wallet.db
+        self._path_finder_with_our_hints = None  # type: Optional[weakref.ref[LNPathFinder]]  # see _path_finder()
+        # What we learned from the results of our htlcs, and saved: the wallets that are loaded share the path
+        # finder, so each keeps what it learned itself, to save that only. Loaded from the db when first used.
+        self._our_liquidity_hints = None  # type: Optional[LiquidityHintMgr]
         self.instantiation_timestamp = int(time.time())
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
@@ -1999,14 +2668,18 @@ class LNWallet(Logger):
         if attempts is None and self.uses_trampoline():
             # we don't expect lots of failed htlcs with trampoline, so we can fail sooner
             attempts = 30
+        # (not beyond the limit of a route, which the invoice may use up already)
+        final_cltv_buffer = max(0, min(
+            MIN_FINAL_CLTV_DELTA_BUFFER_PAYMENT, NBLOCK_CLTV_DELTA_TOO_FAR_INTO_FUTURE - min_final_cltv_delta))
         success, reason = False, _("unknown")
         try:
+            await self._wait_for_chain_tip()
             await self.pay_to_node(
                 node_pubkey=invoice_pubkey,
                 payment_hash=payment_hash,
                 payment_secret=payment_secret,
                 amount_to_pay=amount_to_pay,
-                min_final_cltv_delta=min_final_cltv_delta,
+                min_final_cltv_delta=min_final_cltv_delta + final_cltv_buffer,
                 r_tags=r_tags,
                 invoice_features=invoice_features,
                 attempts=attempts,
@@ -2026,6 +2699,78 @@ class LNWallet(Logger):
                 self._set_sent_payment_failed(payment_hash, reason=reason)
         log = self.logs[key]
         return success, log
+
+    # What the path finder learned about the liquidity of channels from our payments, as liquidity_hints_to_save()
+    # returns it. It tells when we paid, and how much, so it is kept in the wallet file, which can be encrypted.
+    LIQUIDITY_HINTS_DB_KEY = 'lightning_liquidity_hints'
+
+    def _path_finder(self) -> Optional[LNPathFinder]:
+        """The path finder of the network, with the liquidity hints we saved taken over: the first time we
+        use it, which is before it is used for our payments, also after a restart of the gossip."""
+        path_finder = self.network.path_finder if self.network else None
+        # (a weak reference: the path finder holds the graph, which is dropped when the gossip stops)
+        old = self._path_finder_with_our_hints() if self._path_finder_with_our_hints else None
+        if path_finder is not None and path_finder is not old:
+            self._path_finder_with_our_hints = weakref.ref(path_finder)
+            path_finder.import_saved_liquidity_hints(
+                json.dumps(self._get_our_liquidity_hints().export_state(), separators=(',', ':')))
+        return path_finder
+
+    def _get_our_liquidity_hints(self) -> LiquidityHintMgr:
+        if self._our_liquidity_hints is None:
+            self._our_liquidity_hints = LiquidityHintMgr()
+            if data := self.db.get(self.LIQUIDITY_HINTS_DB_KEY):
+                try:
+                    self._our_liquidity_hints.import_state(json.loads(data))
+                except Exception as e:  # then what we learn from now on replaces them
+                    self.logger.warning(f"could not load the saved liquidity hints: {e!r}")
+        return self._our_liquidity_hints
+
+    def _update_liquidity_hints(
+            self, path_finder: LNPathFinder, route: LNPaymentRoute, amount_msat: int, *,
+            failing_channel: Optional[ShortChannelID] = None,
+    ) -> None:
+        """Tells the path finder what the result of our htlc over route tells about the liquidity of its
+        channels, and saves it with what we learned before from our htlcs."""
+        path_finder.update_liquidity_hints(route, amount_msat, failing_channel=failing_channel)
+        try:
+            our_hints = self._get_our_liquidity_hints()
+            our_hints.update_from_route(route, amount_msat, failing_channel=failing_channel)
+            data = json.dumps(our_hints.export_state(), separators=(',', ':'))
+        except Exception:  # the result of the htlc must still be handled
+            self.logger.exception("could not save the liquidity hints")
+            return
+        # written to disk with the state of the channel, the next time it changes
+        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, data)
+
+    def forget_saved_liquidity_hints(self) -> None:
+        self._our_liquidity_hints = LiquidityHintMgr()
+        self.db.put(self.LIQUIDITY_HINTS_DB_KEY, None)
+        self.wallet.save_db()
+
+    WAIT_FOR_CHAIN_TIP_TIMEOUT = 15  # seconds
+
+    async def _wait_for_chain_tip(self) -> None:
+        """The cltv_expiry of our htlcs is counted from our chain tip. Right after the wallet got opened,
+        the headers of the blocks mined meanwhile might still be on their way, and a destination that
+        has seen those blocks would reject the htlcs as expiring too soon. So we wait for them a bit,
+        and while we are not connected to a server, which would tell us about them, for that too."""
+        network = self.network
+        deadline = time.monotonic() + self.WAIT_FOR_CHAIN_TIP_TIMEOUT
+        waited = False
+        while True:
+            server_height = network.get_server_height()
+            local_height = network.get_local_height()
+            if server_height and local_height >= server_height:
+                if waited:
+                    self.logger.info(f"waited for the chain tip: {local_height}")
+                return
+            if time.monotonic() >= deadline:
+                self.logger.info(
+                    f"paying, although our chain tip might be behind: {local_height=}, {server_height=}")
+                return
+            waited = True
+            await asyncio.sleep(0.5)
 
     @log_exceptions
     async def pay_to_node(
@@ -2075,11 +2820,7 @@ class LNWallet(Logger):
             f"r_tags={BOLT11Addr.format_bolt11_routing_info_as_human_readable(r_tags)}. "
             f"{amount_to_pay=} msat. {budget=}")
         if not self.uses_trampoline():
-            self.logger.info(
-                f"gossip_db status. sync progress: {self.network.lngossip.get_sync_progress_estimate()}. "
-                f"num_nodes={self.channel_db.num_nodes}, "
-                f"num_channels={self.channel_db.num_channels}, "
-                f"num_policies={self.channel_db.num_policies}.")
+            self.logger.info(self._gossip_status_for_log())
 
         # when encountering trampoline forwarding difficulties in the legacy case, we
         # sometimes need to fall back to a single trampoline forwarder, at the expense
@@ -2159,6 +2900,8 @@ class LNWallet(Logger):
         or OnionRoutingFailure (if forwarding trampoline).
         """
         if htlc_log.success:
+            if htlc_log.route:
+                self.logger.info(f"htlc succeeded. route: {self._route_to_str_for_log(htlc_log.route, with_source=False)}")
             raise PaymentSuccess()
         # htlc failed
         # if we get a tmp channel failure, it might work to split the amount and try more routes
@@ -2173,6 +2916,11 @@ class LNWallet(Logger):
         self.logger.info(f"UPDATE_FAIL_HTLC. code={repr(code)}. "
                          f"decoded_data={failure_msg.decode_data()}. data={data.hex()!r}")
         self.logger.info(f"error reported by {erring_node_id.hex()}")
+        if not self.uses_trampoline():  # note: with trampoline, sender_idx is about the trampoline route
+            failing_edge = sender_idx + 1
+            where = (f"at edge {failing_edge + 1} of {len(route)} (channel {_scid_for_log(route[failing_edge])})"
+                     if failing_edge < len(route) else "at the destination")
+            self.logger.info(f"htlc failed {where}. route: {self._route_to_str_for_log(route, with_source=False)}")
         if code == OnionFailureCode.MPP_TIMEOUT:
             raise PaymentFailure(failure_msg.code_name())
         # errors returned by the next trampoline.
@@ -2228,7 +2976,54 @@ class LNWallet(Logger):
         if self.network.path_finder:
             # add inflight htlcs to liquidity hints; removed again in htlc_fulfilled/htlc_failed
             self.network.path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=True)
+        try:
+            # note: with trampoline, the fees of the trampolines are included in the amount
+            fee_msat = shi.amount_msat - shi.amount_receiver_msat + _route_fee_msat(shi.route, shi.amount_msat)
+            self.logger.info(
+                f"sent htlc {htlc.htlc_id} over {chan.get_id_for_log()}: amount={shi.amount_receiver_msat} msat, "
+                f"fee={fee_msat} msat. route: {self._route_to_str_for_log(shi.route)}")
+        except Exception:  # logging must not break the payment
+            self.logger.exception('failed to log the route')
         util.trigger_callback('htlc_added', chan, htlc, SENT)
+
+    def _gossip_status_for_log(self) -> str:
+        db = self.channel_db
+        # note: the db is being written without lock while it loads, so we must not iterate it then
+        newest_policy_age = _age_for_log(db.get_latest_policy_timestamp()) if db.data_loaded.is_set() else 'loading'
+        return (
+            f"gossip_db status. sync progress: {self.network.lngossip.get_sync_progress_estimate()}. "
+            f"num_nodes={db.num_nodes}, num_channels={db.num_channels}, num_policies={db.num_policies}, "
+            f"newest_policy_age={newest_policy_age}.")
+
+    def _route_to_str_for_log(self, route: LNPaymentRoute, *, with_source: bool = True) -> str:
+        """Describes a route in one line: for every channel the fee and cltv delta we used, and where
+        they came from (the age of the channel_update in our gossip db, or the route hint).
+        The source is only meaningful when the route was just created: the db might have changed since.
+        """
+        now = int(time.time())
+        parts = []
+        for edge in route:
+            if not with_source:
+                source = ''
+            elif edge.start_node == self.node_keypair.pubkey:
+                source = 'own channel'
+            elif self.channel_db is None:
+                source = ''
+            else:
+                policy = self.channel_db.get_policy_for_node(_scid_for_log(edge), edge.start_node)
+                if policy is None or not policy.timestamp:
+                    source = 'route hint'
+                elif (policy.fee_base_msat, policy.fee_proportional_millionths, policy.cltv_delta) \
+                        != (edge.fee_base_msat, edge.fee_proportional_millionths, edge.cltv_delta):
+                    source = f'route used an older update, db has one {_age_for_log(policy.timestamp, now=now)} old'
+                else:
+                    source = f'update {_age_for_log(policy.timestamp, now=now)} old'
+            parts.append(
+                f"{edge.start_node.hex()[:10]} -[{_scid_for_log(edge)} "
+                f"{edge.fee_base_msat}+{edge.fee_proportional_millionths}ppm cltv {edge.cltv_delta}"
+                + (f", {source}" if source else "") + "]->")
+        parts.append(route[-1].end_node.hex()[:10] if route else '')
+        return ' '.join(parts)
 
     def handle_error_code_from_failed_htlc(
             self,
@@ -2240,7 +3035,8 @@ class LNWallet(Logger):
     ) -> None:
 
         assert self.channel_db  # cannot be in trampoline mode
-        assert self.network.path_finder
+        path_finder = self._path_finder()
+        assert path_finder
 
         code, data = failure_msg.code, failure_msg.data
         # TODO can we use lnmsg.OnionWireSerializer here?
@@ -2256,10 +3052,13 @@ class LNWallet(Logger):
         }
         try:
             failing_channel = route[sender_idx + 1].short_channel_id
+            # the channel_update names the scid of the onion
+            update_scid = route[sender_idx + 1].onion_short_channel_id or failing_channel
         except IndexError:
             raise PaymentFailure(f'payment destination reported error: {failure_msg.code_name()}') from None
+        # the nodes up to the one that returned the error are online
+        path_finder.report_nodes_online([edge.start_node for edge in route[1:sender_idx + 2]])
 
-        # TODO: handle unknown next peer?
         # handle failure codes that may include a channel update
         if code in failure_codes:
             offset = failure_codes[code]
@@ -2275,7 +3074,7 @@ class LNWallet(Logger):
                 self.logger.info(f'could not decode channel_update for failed htlc: '
                                  f'{channel_update_as_received.hex()}')
                 blacklist = True
-            elif payload.get('short_channel_id') != failing_channel:
+            elif payload.get('short_channel_id') != update_scid:
                 self.logger.info(f'short_channel_id in channel_update does not match our route')
                 blacklist = True
             else:
@@ -2286,15 +3085,28 @@ class LNWallet(Logger):
             # we interpret a temporary channel failure as a liquidity issue
             # in the channel and update our liquidity hints accordingly
             if code == OnionFailureCode.TEMPORARY_CHANNEL_FAILURE:
-                self.network.path_finder.update_liquidity_hints(
+                self._update_liquidity_hints(
+                    path_finder,
                     route,
                     amount_msat,
                     failing_channel=ShortChannelID(failing_channel))
+            # the node likely changed the fee or cltv delta of its parallel channels to the same node too
+            if code in (OnionFailureCode.FEE_INSUFFICIENT, OnionFailureCode.INCORRECT_CLTV_EXPIRY) and not blacklist:
+                edge = route[sender_idx + 1]
+                path_finder.liquidity_hints.update_outdated_policy(
+                    edge.start_node, edge.end_node,
+                    policy=(edge.fee_base_msat, edge.fee_proportional_millionths, edge.cltv_delta))
         # for errors that never include a channel update
         else:
             blacklist = True
+            next_node = route[sender_idx + 1].end_node
+            if (code == OnionFailureCode.UNKNOWN_NEXT_PEER and next_node != self.node_keypair.pubkey
+                    and self.lnpeermgr.get_peer_by_pubkey(next_node) is None):
+                # if several nodes cannot forward to the next node, it is likely offline
+                # (but not if it is us, or we are connected to it)
+                path_finder.report_unknown_next_peer(route[sender_idx + 1].start_node, next_node)
         if blacklist:
-            self.network.path_finder.add_edge_to_blacklist(short_channel_id=failing_channel)
+            path_finder.add_edge_to_blacklist(short_channel_id=failing_channel)
 
     def _handle_chanupd_from_failed_htlc(
         self, payload, *,
@@ -2327,22 +3139,47 @@ class LNWallet(Logger):
                 # a mobile phone with the app closed. So we cache this with a short TTL.
                 cache_ttl = self.channel_db.PRIVATE_CHAN_UPD_CACHE_TTL_SHORT
             handled = self.channel_db.add_channel_update_for_private_channel(payload, start_node_id, cache_ttl=cache_ttl)
+            if not handled and self._failed_route_used_outdated_policy(payload, route=route, sender_idx=sender_idx):
+                handled = True
             blacklist = not handled
         elif r == UpdateStatus.EXPIRED:
             blacklist = True
-        elif r == UpdateStatus.DEPRECATED:
-            self.logger.info(f'channel update is not more recent.')
-            blacklist = True
-        elif r == UpdateStatus.UNCHANGED:
+        elif r in (UpdateStatus.DEPRECATED, UpdateStatus.UNCHANGED):
+            # note: DEPRECATED is what we get for the common case of the error carrying
+            #       the very same channel_update we already have in our db.
+            self.logger.info(f'channel update is not more recent or did not change anything.')
             if failure_msg.code == OnionFailureCode.TEMPORARY_CHANNEL_FAILURE:
                 # the sent htlc might have exceeded the channel's liquidity, no need to blacklist,
                 # we record liquidity hints and can attempt again with a smaller htlc
+                handled = True
+            elif (r == UpdateStatus.DEPRECATED
+                    and self._failed_route_used_outdated_policy(payload, route=route, sender_idx=sender_idx)):
+                # we already know this update, e.g. from another part of the same payment
                 handled = True
             else:
                 blacklist = True
         else:
             raise Exception(f"unexpected chan upd UpdateStatus: {r}")
         return blacklist, handled
+
+    def _failed_route_used_outdated_policy(
+        self, payload: dict, *,
+        route: LNPaymentRoute,
+        sender_idx: int,
+    ) -> bool:
+        """Returns whether the channel_update of a failure is what we believe to be the current
+        policy of the channel, but the route was created with different parameters.
+        (if so, the next route will work with the policy we have now, no need to avoid the channel)
+        """
+        edge = route[sender_idx + 1]
+        policy = self.channel_db.get_policy_for_node(
+            edge.onion_short_channel_id or edge.short_channel_id, route[sender_idx].node_id)
+        if policy is None:
+            return False
+        update_params = payload['fee_base_msat'], payload['fee_proportional_millionths'], payload['cltv_expiry_delta']
+        policy_params = policy.fee_base_msat, policy.fee_proportional_millionths, policy.cltv_delta
+        route_params = edge.fee_base_msat, edge.fee_proportional_millionths, edge.cltv_delta
+        return update_params == policy_params and route_params != policy_params
 
     @classmethod
     def _decode_channel_update_msg(cls, chan_upd_msg: bytes) -> Optional[Dict[str, Any]]:
@@ -2471,6 +3308,10 @@ class LNWallet(Logger):
         trampoline_features = LnFeatures.VAR_ONION_OPT
         local_height = self.wallet.adb.get_local_height()
         fee_related_error = None  # type: Optional[FeeBudgetExceeded]
+        if not paysession.uses_trampoline and paysession.penalty_weight() != 1:
+            self.logger.info(
+                f"path finding with the penalties weighted {paysession.penalty_weight()}, "
+                f"after {paysession.num_failed_htlcs} failed htlcs")
         if channels:
             my_active_channels = channels
         else:
@@ -2573,43 +3414,59 @@ class LNWallet(Logger):
                 else:
                     # We atomically loop through a split configuration. If there was
                     # a failure to find a path for a single part, we try the next configuration
-                    for (chan_id, _), part_amounts_msat in sc.config.items():
-                        for part_amount_msat in part_amounts_msat:
-                            channel = self._channels[chan_id]
-                            if is_direct_path:
-                                route = self.create_direct_route(
+                    # None of the htlcs are sent yet, so for path-finding count the routes we
+                    # already selected as inflight, or all parts would take the same path.
+                    # (the real accounting happens in pay_to_route, so this is undone below)
+                    counted_inflight_routes = []
+                    path_finder = self._path_finder()
+                    # each part gets its share of the budget
+                    part_budget = budget._replace(fee_msat=budget.fee_msat // sc.config.number_parts())
+                    try:
+                        for (chan_id, _), part_amounts_msat in sc.config.items():
+                            for part_amount_msat in part_amounts_msat:
+                                channel = self._channels[chan_id]
+                                if is_direct_path:
+                                    route = self.create_direct_route(
+                                        amount_msat=part_amount_msat,
+                                        channel=channel,
+                                    )
+                                else:
+                                    assert not self.uses_trampoline()
+                                    route = await run_in_thread(partial(
+                                        self.create_route_for_single_htlc,
+                                        amount_msat=part_amount_msat,
+                                        invoice_pubkey=paysession.invoice_pubkey,
+                                        r_tags=paysession.r_tags,
+                                        invoice_features=paysession.invoice_features,
+                                        my_sending_channels=[channel] if is_mpp else my_active_channels,
+                                        full_path=full_path,
+                                        max_fee_msat=part_budget.fee_msat,
+                                        penalty_weight=paysession.penalty_weight(),
+                                    ))
+                                if not is_route_within_budget(
+                                        route, budget=part_budget,
+                                        amount_msat_for_dest=part_amount_msat,
+                                        cltv_delta_for_dest=paysession.min_final_cltv_delta,
+                                        we_are_forwarding=we_are_forwarding):
+                                    self.logger.info(f"rejecting route (exceeds budget): {route=}. {budget=}")
+                                    raise FeeBudgetExceeded()
+                                shi = SentHtlcInfo(
+                                    route=route,
+                                    payment_secret_orig=paysession.payment_secret,
+                                    payment_secret_bucket=paysession.payment_secret,
                                     amount_msat=part_amount_msat,
-                                    channel=channel,
+                                    bucket_msat=paysession.amount_to_pay,
+                                    amount_receiver_msat=part_amount_msat,
+                                    trampoline_fee_level=None,
+                                    trampoline_route=None,
                                 )
-                            else:
-                                assert not self.uses_trampoline()
-                                route = await run_in_thread(partial(
-                                    self.create_route_for_single_htlc,
-                                    amount_msat=part_amount_msat,
-                                    invoice_pubkey=paysession.invoice_pubkey,
-                                    r_tags=paysession.r_tags,
-                                    invoice_features=paysession.invoice_features,
-                                    my_sending_channels=[channel] if is_mpp else my_active_channels,
-                                    full_path=full_path,
-                                ))
-                            if not is_route_within_budget(
-                                    route, budget=budget._replace(fee_msat=budget.fee_msat // sc.config.number_parts()),
-                                    amount_msat_for_dest=part_amount_msat,
-                                    cltv_delta_for_dest=paysession.min_final_cltv_delta,
-                                    we_are_forwarding=we_are_forwarding):
-                                self.logger.info(f"rejecting route (exceeds budget): {route=}. {budget=}")
-                                raise FeeBudgetExceeded()
-                            shi = SentHtlcInfo(
-                                route=route,
-                                payment_secret_orig=paysession.payment_secret,
-                                payment_secret_bucket=paysession.payment_secret,
-                                amount_msat=part_amount_msat,
-                                bucket_msat=paysession.amount_to_pay,
-                                amount_receiver_msat=part_amount_msat,
-                                trampoline_fee_level=None,
-                                trampoline_route=None,
-                            )
-                            routes.append((shi, paysession.min_final_cltv_delta, fwd_trampoline_onion))
+                                routes.append((shi, paysession.min_final_cltv_delta, fwd_trampoline_onion))
+                                if not is_direct_path and path_finder:
+                                    path_finder.update_num_inflight_htlcs(route, add_htlcs=True)
+                                    counted_inflight_routes.append(route)
+                    finally:
+                        for route in counted_inflight_routes:
+                            path_finder.update_num_inflight_htlcs(route, add_htlcs=False)
             except NoPathFound:
                 continue
             except FeeBudgetExceeded as e:
@@ -2656,6 +3513,8 @@ class LNWallet(Logger):
             invoice_features: int,
             my_sending_channels: List[Channel],
             full_path: Optional[LNPaymentPath],
+            max_fee_msat: Optional[int] = None,  # fee budget of the route
+            penalty_weight: float = 1,  # of the costs other than fees, see PaySession.penalty_weight
     ) -> LNPaymentRoute:
 
         my_sending_aliases = set(chan.get_local_scid_alias() for chan in my_sending_channels)
@@ -2665,6 +3524,7 @@ class LNWallet(Logger):
         # Note: if some route hints are multiple edges long, and these paths cross each other,
         #       we allow our path finding to cross the paths; i.e. the route hints are not isolated.
         private_route_edges = {}  # type: Dict[ShortChannelID, RouteEdge]
+        hint_edges = []  # type: List[RouteEdge]
         for private_path in r_tags:
             # we need to shift the node pubkey by one towards the destination:
             private_path_nodes = [edge[0] for edge in private_path][1:] + [invoice_pubkey]
@@ -2701,17 +3561,55 @@ class LNWallet(Logger):
                         fee_proportional_millionths=fee_proportional_millionths,
                         cltv_delta=cltv_delta,
                         node_features=node_info.features if node_info else 0)
-                private_route_edges[route_edge.short_channel_id] = route_edge
+                hint_edges.append(route_edge)
                 start_node = end_node
+        # Hints from different nodes may use the same scid alias. Those are different channels: give each
+        # of them a local short_channel_id, which only depends on the alias and the nodes, so that their
+        # blacklist entries and liquidity hints stay with them, whatever the (shuffled) order of the hints.
+        pairs_for_scid = defaultdict(set)
+        for route_edge in hint_edges:
+            pairs_for_scid[route_edge.short_channel_id].add((route_edge.start_node, route_edge.end_node))
+        taken = set(pairs_for_scid)
+        local_scids = {}
+        for route_edge in hint_edges:
+            scid = route_edge.short_channel_id
+            # an edge from us keeps its scid: the first channel of a route has to be one of ours
+            if len(pairs_for_scid[scid]) > 1 and route_edge.start_node != self.node_keypair.pubkey:
+                key = (scid, route_edge.start_node, route_edge.end_node)
+                if key not in local_scids:
+                    local_scids[key] = local_scid_for_route_hint(
+                        scid, route_edge.start_node, route_edge.end_node, taken=taken)
+                    taken.add(local_scids[key])
+                route_edge = dataclasses.replace(
+                    route_edge, short_channel_id=local_scids[key], onion_short_channel_id=scid)
+            private_route_edges[route_edge.short_channel_id] = route_edge
         # now find a route, end to end: between us and the recipient
+        find_route = partial(
+            self.network.path_finder.find_route,
+            nodeA=self.node_keypair.pubkey,
+            nodeB=invoice_pubkey,
+            invoice_amount_msat=amount_msat,
+            path=full_path,
+            my_sending_channels=my_sending_channels,
+            private_route_edges=private_route_edges)
+        search_info = {}
         try:
-            route = self.network.path_finder.find_route(
-                nodeA=self.node_keypair.pubkey,
-                nodeB=invoice_pubkey,
-                invoice_amount_msat=amount_msat,
-                path=full_path,
-                my_sending_channels=my_sending_channels,
-                private_route_edges=private_route_edges)
+            route = find_route(max_fee_msat=max_fee_msat, penalty_weight=penalty_weight, search_info=search_info)
+            if not route and search_info.get('budget_pruned'):
+                # (if the budget left no path out, there is none at all)
+                # Path finding keeps one path per node, so it can miss a path within the budget
+                # that costs more in penalties. The path with the lowest fees (the penalties only
+                # breaking ties) tells whether there is one: if it exceeds the budget, so does any
+                # other, and the caller can tell that the budget is the problem.
+                self.logger.info(
+                    f"no path found within the fee budget of {max_fee_msat} msat. "
+                    f"looking for the path with the lowest fees, without the budget")
+                route = find_route(penalty_weight=0)
+                if route and _route_fee_msat(route, amount_msat) <= max_fee_msat:
+                    # there is one: prefer a path that still takes the penalties into account
+                    lower_weight = 0.25 * penalty_weight
+                    self.logger.info(f"it is within the budget. looking again with the penalties weighted {lower_weight}")
+                    route = find_route(max_fee_msat=max_fee_msat, penalty_weight=lower_weight) or route
         except NoChannelPolicy as e:
             raise NoPathFound() from e
         if not route:
@@ -3267,9 +4165,9 @@ class LNWallet(Logger):
         shi = self.sent_htlcs_info.get((payment_hash, chan.short_channel_id, htlc_id))
         if shi and htlc_id in chan.onion_keys:
             chan.pop_onion_key(htlc_id)
-            if self.network.path_finder:
-                self.network.path_finder.update_liquidity_hints(shi.route, shi.amount_receiver_msat)
-                self.network.path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=False)
+            if path_finder := self._path_finder():
+                self._update_liquidity_hints(path_finder, shi.route, shi.amount_receiver_msat)
+                path_finder.update_num_inflight_htlcs(shi.route, add_htlcs=False)
             payment_key = payment_hash + shi.payment_secret_orig
             paysession = self._paysessions[payment_key]
             q = paysession.sent_htlcs_q
@@ -4420,7 +5318,7 @@ class LNWallet(Logger):
             payment_secret=payment_secret)
         self.logger.info(f"pay len(route)={len(route)}. for payment_hash={payment_hash.hex()}")
         for i in range(len(route)):
-            self.logger.info(f"  {i}: edge={route[i].short_channel_id} hop_data={hops_data[i]!r}")
+            self.logger.info(f"  {i}: edge={route[i].onion_short_channel_id or route[i].short_channel_id} hop_data={hops_data[i]!r}")
         assert final_cltv_abs <= cltv_abs, (final_cltv_abs, cltv_abs)
         session_key = crandom.get_rand_bytes(32)  # session_key
         # if we are forwarding a trampoline payment, add trampoline onion

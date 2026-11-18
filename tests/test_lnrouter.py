@@ -1,9 +1,17 @@
+import asyncio
+import itertools
+import json
 import random
+import sqlite3
+import time
+import types
 import unittest
 from math import inf
 from unittest import mock
 from typing import Optional
 from os import urandom
+
+import aiorpcx
 
 from electrum import util
 from electrum.channel_db import NodeInfo
@@ -15,12 +23,22 @@ from electrum.lnutil import ShortChannelID, LnFeatures, PaymentFeeBudget
 from electrum.lnonion import (OnionHopsDataSingle, new_onion_packet,
                               process_onion_packet, _decode_onion_error, decode_onion_error,
                               OnionFailureCode)
-from electrum import bitcoin, lnrouter
+from electrum import bitcoin, lnrouter, lnworker, gossip_catch_up
 from electrum.constants import BitcoinTestnet
 from electrum.simple_config import SimpleConfig
+from electrum.lnpeer import Peer
+from electrum.lntransport import LNPeerAddr
+from electrum.interface import GracefulDisconnect
+from electrum import lnpeer as lnpeer_module
+from electrum.sql_db import sql
+from electrum.lnworker import LNGossip
+from electrum.lnmsg import encode_msg
 from electrum.lnrouter import (PathEdge, LiquidityHintMgr, DEFAULT_PENALTY_PROPORTIONAL_MILLIONTH,
-                               DEFAULT_PENALTY_BASE_MSAT, fee_for_edge_msat, LNPaymentTRoute, TrampolineEdge,
-                               HINT_DURATION)
+                               fee_for_edge_msat, LNPaymentTRoute, TrampolineEdge,
+                               HINT_DURATION, PAIR_FAILURE_PENALTY_FACTOR, RouteEdge,
+                               FAILURE_MEMORY_DURATION, OLD_FAILURE_PENALTY_FACTOR,
+                               NODE_FAILURE_MIN_SENDERS, NODE_FAILURE_PENALTY_FACTOR, NODE_FAILURE_PRICE_STEP,
+                               OFFLINE_NODE_DURATION, MAX_OUTDATED_POLICIES_PER_PAIR)
 
 from . import ElectrumTestCase
 from .test_bitcoin import needs_test_with_all_chacha20_implementations
@@ -43,6 +61,1833 @@ def node_features(extra: LnFeatures = None) -> bytes:
     if extra:
         lnf |= extra
     return lnf.to_bytes(8, 'big')
+
+
+class _FakeGossipPeer:
+    """what LNGossip looks at in a Peer that sends us gossip"""
+
+    def __init__(self, character: str, *, lnpeermgr, resends_old_gossip: bool):
+        self.pubkey = node(character)
+        self.our_gossip_timestamp_filter = types.SimpleNamespace(first_timestamp=0, timestamp_range=0xFFFFFFFF)
+        self.num_gossip_msgs_received = 0
+        self.num_gossip_backlog_updates_received = 0
+        self.num_gossip_updates_not_asked_for = 0
+        self.pruned_chans_announced = set()
+        self.recv_gossip_queue = asyncio.Queue()
+        self.is_querying_short_channel_ids = False
+        self.answers_channel_queries = True
+        self.responds = True  # whether the connection is alive: messages and pongs arrive
+        self._last_message_time = time.time()
+        self.last_pong_time = 0.
+        self.num_pings = 0
+        self.requested = []  # the first_timestamp of the gossip_timestamp_filters we sent
+        self.requested_ranges = []  # their timestamp_range
+        self._lnpeermgr = lnpeermgr
+        self._resends_old_gossip = resends_old_gossip
+        self._was_asked_for_old_gossip = False
+        self.is_connected = True
+        lnpeermgr._peers[self.pubkey] = self
+
+    @property
+    def last_message_time(self):
+        return time.time() if self.responds else self._last_message_time
+
+    def is_initialized(self) -> bool:
+        return self.is_connected
+
+    def send_ping(self):
+        self.num_pings += 1
+        if self.responds:
+            self.last_pong_time = time.time()
+
+    def request_gossip(self, timestamp, timestamp_range=0xFFFFFFFF):
+        self.our_gossip_timestamp_filter = types.SimpleNamespace(first_timestamp=timestamp, timestamp_range=timestamp_range)
+        self.requested.append(timestamp)
+        self.requested_ranges.append(timestamp_range)
+        self.num_gossip_backlog_updates_received = 0
+        self.num_gossip_updates_not_asked_for = 0
+        self._was_asked_for_old_gossip = timestamp < time.time() - Peer.GOSSIP_NEWS_MAX_AGE
+
+    def receive(self, num_msgs: int):
+        if not self.responds:
+            return
+        self.num_gossip_msgs_received += num_msgs
+        if num_msgs:
+            self._last_message_time = time.time()
+        if self._resends_old_gossip and self._was_asked_for_old_gossip:
+            self.num_gossip_backlog_updates_received += num_msgs
+
+    def close_and_cleanup(self):
+        self.is_connected = False
+        if self._lnpeermgr._peers.get(self.pubkey) is self:
+            del self._lnpeermgr._peers[self.pubkey]
+
+
+class TestGossipBacklog(ElectrumTestCase):
+
+    NOW = 1_800_000_000
+    TICK = LNGossip.GOSSIP_SYNC_TICK
+    QUIET_TICKS = LNGossip.GOSSIP_CATCH_UP_QUIET_TICKS
+    BUSY = 40 * LNGossip.GOSSIP_CATCH_UP_QUIET_RATE * TICK  # messages per tick, while sending the backlog
+    QUIET = LNGossip.GOSSIP_CATCH_UP_QUIET_RATE * TICK  # messages per tick, at most, when only relaying
+
+    def setUp(self):
+        super().setUp()
+        self.now = self.NOW
+        patcher = mock.patch('time.time', side_effect=lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.saved = []  # what got recorded in the db as "synced until"
+
+    def _lngossip(self, *, latest_ts: Optional[int] = None, synced_until: Optional[int] = None,
+                  num_policies: int = 50_000) -> LNGossip:
+        g = LNGossip(SimpleConfig({'electrum_path': self.electrum_path}))
+        self.addCleanup(g.lnpeermgr.unregister_callbacks)
+        g.lnpeermgr.network = mock.Mock(channel_db=mock.Mock(
+            latest_policy_ts_at_load=latest_ts,
+            synced_until_at_load=synced_until,
+            num_policies=num_policies,
+            save_synced_until=self.saved.append))
+        return g
+
+    def _connect(self, g: LNGossip, character: str, *, resends_old_gossip: bool = True) -> _FakeGossipPeer:
+        """as Peer._query_gossip does, after the reply to its query_channel_range"""
+        peer = _FakeGossipPeer(character, lnpeermgr=g.lnpeermgr, resends_old_gossip=resends_old_gossip)
+        peer.request_gossip(*g.get_gossip_timestamp_filter(peer))
+        return peer
+
+    def _tick(self, g: LNGossip, msgs: dict = None, *, seconds: int = TICK, times: int = 1) -> None:
+        """msgs: peer -> number of gossip messages it sends during a tick"""
+        for _ in range(times):
+            self.now += seconds
+            for peer, num_msgs in (msgs or {}).items():
+                peer.receive(num_msgs)
+                g._num_chan_upd += num_msgs  # they get processed
+            g._gossip_sync_tick()
+
+    def _catch_up(self, g: LNGossip, *peers: _FakeGossipPeer) -> int:
+        """The peers send some backlog and then get quiet. Returns when gossip last arrived."""
+        self._tick(g, {peer: self.BUSY for peer in peers})
+        last_rx_time = self.now
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertTrue(g.is_caught_up())
+        return last_rx_time
+
+    async def test_add_new_ids_skips_recently_orphaned_only_on_request(self):
+        known, orphaned, new = b'\x01' * 8, b'\x02' * 8, b'\x03' * 8
+        g = mock.Mock(
+            spec=LNGossip,
+            channel_db=mock.Mock(get_channel_ids=lambda: {known}, get_recently_orphaned_channel_ids=lambda: {orphaned}),
+            lnpeermgr=mock.Mock(num_peers=lambda: 1),
+            unknown_ids=set(),
+        )
+        await LNGossip.add_new_ids(g, [known, orphaned, new], skip_recently_orphaned=True)
+        self.assertEqual({new}, g.unknown_ids)
+        # orphaned channel_updates show that the channel is alive after all
+        await LNGossip.add_new_ids(g, [orphaned])
+        self.assertEqual({new, orphaned}, g.unknown_ids)
+
+    async def test_query_gossip_uses_backlog_start_and_skips_orphaned_after_db_is_loaded(self):
+        class StopQueryLoop(Exception): pass
+        ids = {b'\x01' * 8}
+        gossip = mock.Mock()
+        gossip.network.lngossip = gossip
+        gossip.channel_db.data_loaded.wait = mock.AsyncMock()
+        def check_db_loaded(*args, **kwargs):
+            gossip.channel_db.data_loaded.wait.assert_awaited_once()
+        gossip.add_new_ids = mock.AsyncMock(side_effect=check_db_loaded)
+        gossip.on_channel_range_reply = mock.AsyncMock(side_effect=check_db_loaded)
+        gossip.get_gossip_timestamp_filter.return_value = (1234, 5678)
+        gossip.get_ids_to_query.side_effect = StopQueryLoop
+        peer = mock.Mock(lnworker=gossip, is_initialized=lambda: True)
+        peer.get_channel_range = mock.AsyncMock(return_value=(ids, True))
+        with self.assertRaises(StopQueryLoop):
+            await Peer._query_gossip(peer)
+        gossip.add_new_ids.assert_awaited_once_with(ids, skip_recently_orphaned=True, listed_by=peer.pubkey)
+        gossip.on_channel_range_reply.assert_awaited_once_with(peer.pubkey, ids)
+        gossip.get_gossip_timestamp_filter.assert_called_once_with(peer)
+        peer.request_gossip.assert_called_once_with(1234, 5678)
+
+    def _gossip_for_new_ids(self, *, known, orphaned=()):
+        g = mock.Mock(
+            spec=LNGossip,
+            channel_db=mock.Mock(get_channel_ids=lambda: set(known), get_recently_orphaned_channel_ids=lambda: set(orphaned),
+                                 num_usable_channels=len(known)),
+            lnpeermgr=mock.Mock(num_peers=lambda: 1),
+            unknown_ids=set(),
+            _unknown_ids_listed_by={},
+            CHANNEL_QUERY_MIN_PEERS=LNGossip.CHANNEL_QUERY_MIN_PEERS,
+            CHANNEL_QUERY_FIRST_SYNC_CHANNELS=LNGossip.CHANNEL_QUERY_FIRST_SYNC_CHANNELS,
+        )
+        return g
+
+    async def test_unknown_channel_of_a_channel_range_is_queried_once_two_peers_list_it(self):
+        known = {bytes([1]) + i.to_bytes(7, 'big') for i in range(LNGossip.CHANNEL_QUERY_FIRST_SYNC_CHANNELS)}
+        orphaned, a, b, c = b'\x02' * 8, b'\x03' * 8, b'\x04' * 8, b'\x05' * 8
+        g = self._gossip_for_new_ids(known=known, orphaned=[orphaned])
+        some_known = next(iter(known))
+        await LNGossip.add_new_ids(g, [some_known, orphaned, a, b], skip_recently_orphaned=True, listed_by=b'peer1')
+        self.assertEqual(set(), g.unknown_ids)  # one peer: most likely a channel the others forgot
+        await LNGossip.add_new_ids(g, [a, b], skip_recently_orphaned=True, listed_by=b'peer1')
+        self.assertEqual(set(), g.unknown_ids)  # (the same peer again counts once)
+        await LNGossip.add_new_ids(g, [a, orphaned], skip_recently_orphaned=True, listed_by=b'peer2')
+        self.assertEqual({a}, g.unknown_ids)
+        self.assertEqual({b: {b'peer1'}}, g._unknown_ids_listed_by)
+        # not from a channel range (an update for an unknown channel, a query that timed out): at once
+        await LNGossip.add_new_ids(g, [c])
+        self.assertEqual({a, c}, g.unknown_ids)
+        # a channel we learned of otherwise does not wait for a vote any more
+        known.add(b)
+        await LNGossip.add_new_ids(g, [], skip_recently_orphaned=True, listed_by=b'peer3')
+        self.assertEqual({}, g._unknown_ids_listed_by)
+
+    async def test_unknown_channels_of_the_first_channel_range_of_an_empty_db_are_queried(self):
+        g = self._gossip_for_new_ids(known={b'\x01' * 8})
+        await LNGossip.add_new_ids(g, [b'\x03' * 8], skip_recently_orphaned=True, listed_by=b'peer1')
+        self.assertEqual({b'\x03' * 8}, g.unknown_ids)
+        # told by the channels that have a policy: many announcements without one are still the first sync
+        known = {bytes([1]) + i.to_bytes(7, 'big') for i in range(LNGossip.CHANNEL_QUERY_FIRST_SYNC_CHANNELS)}
+        g = self._gossip_for_new_ids(known=known)
+        g.channel_db.num_usable_channels = 0
+        await LNGossip.add_new_ids(g, [b'\x03' * 8], skip_recently_orphaned=True, listed_by=b'peer1')
+        self.assertEqual({b'\x03' * 8}, g.unknown_ids)
+
+    async def test_announcement_of_a_recently_orphaned_channel_is_dropped_unless_it_got_a_fresh_policy(self):
+        orphaned, revived, new = channel(2), channel(3), channel(4)
+        now = int(time.time())
+        g = mock.Mock(
+            spec=LNGossip, logger=mock.Mock(), channel_db=mock.Mock(), add_new_ids=mock.AsyncMock(),
+            max_age=LNGossip.max_age, _num_chan_ann=0, _num_node_ann=0, _num_chan_upd=0, _num_chan_upd_good=0,
+        )
+        g.channel_db.data_loaded.wait = mock.AsyncMock()
+        g.channel_db.get_channel_ids.return_value = set()
+        g.channel_db.get_recently_orphaned_among = lambda scids: {scid for scid in scids if scid in (orphaned, revived)}
+        g.channel_db.add_channel_updates.return_value = mock.Mock(orphaned=[], good=[])
+        anns = [{'short_channel_id': scid} for scid in (orphaned, revived, new)]
+        upds = [{'short_channel_id': orphaned, 'timestamp': now - LNGossip.max_age - 10},  # the old policy again
+                {'short_channel_id': revived, 'timestamp': now - 60}]
+        await LNGossip._process_gossip(g, anns, [], upds)
+        added, = g.channel_db.add_channel_announcements.call_args.args
+        self.assertEqual([revived, new], [a['short_channel_id'] for a in added])
+        self.assertEqual([revived, new], [c.args[0]['short_channel_id'] for c in g.channel_db.verify_channel_announcement.call_args_list])
+
+    async def test_orphaned_channel_update_still_triggers_a_query(self):
+        orphaned_id = b'\x02' * 8
+        g = mock.Mock(
+            spec=LNGossip,
+            logger=mock.Mock(),
+            channel_db=mock.Mock(),
+            add_new_ids=mock.AsyncMock(),
+            _num_chan_ann=0, _num_node_ann=0, _num_chan_upd=0, _num_chan_upd_good=0,
+        )
+        g.channel_db.data_loaded.wait = mock.AsyncMock()
+        g.channel_db.add_channel_updates.return_value = mock.Mock(orphaned=[{'short_channel_id': orphaned_id}], good=[])
+        await LNGossip._process_gossip(g, [], [], [{'short_channel_id': orphaned_id}])
+        g.add_new_ids.assert_awaited_once_with([orphaned_id])
+        # (the update is not expired: a channel we pruned recently is alive after all)
+        g.channel_db.forget_orphaned_channels.assert_called_once_with([orphaned_id])
+
+    async def test_query_for_channels_that_gets_no_reply_times_out(self):
+        # e.g. LDK does not reply to query_short_channel_ids
+        ids = [b'\x01' * 8, b'\x02' * 8]
+        gossip = mock.Mock()
+        gossip.network.lngossip = gossip
+        gossip.channel_db.data_loaded.wait = mock.AsyncMock()
+        gossip.add_new_ids = mock.AsyncMock()
+        gossip.on_channel_range_reply = mock.AsyncMock()
+        gossip.get_gossip_timestamp_filter.return_value = (1234, 5678)
+        gossip.get_ids_to_query.return_value = ids
+        peer = mock.Mock(lnworker=gossip, is_initialized=lambda: True, querying=asyncio.Event(),
+                         is_querying_short_channel_ids=False, answers_channel_queries=True,
+                         QUERY_SHORT_CHANNEL_IDS_TIMEOUT=0.05)
+        peer.get_channel_range = mock.AsyncMock(return_value=(set(), True))
+        seen = []
+        def query_short_channel_ids(ids):
+            seen.append(peer.is_querying_short_channel_ids)
+        peer.query_short_channel_ids = query_short_channel_ids
+        peer.get_short_channel_ids = lambda ids: Peer.get_short_channel_ids(peer, ids)
+        await asyncio.wait_for(Peer._query_gossip(peer), 5)  # returns: the peer is not asked for channels again
+        self.assertEqual([True], seen)
+        self.assertFalse(peer.is_querying_short_channel_ids)
+        self.assertIs(False, peer.answers_channel_queries)
+        gossip.get_ids_to_query.assert_called_once_with(peer)
+        # the ids go back to the pool, for the other peers
+        self.assertEqual([mock.call(set(), skip_recently_orphaned=True, listed_by=peer.pubkey), mock.call(ids)],
+                         gossip.add_new_ids.await_args_list)
+
+    def _peer_for_gossip_handlers(self) -> mock.Mock:
+        peer = mock.Mock(
+            num_gossip_msgs_received=0, is_querying_short_channel_ids=False, recv_gossip_queue=asyncio.Queue(),
+            GOSSIP_NEWS_MAX_AGE=Peer.GOSSIP_NEWS_MAX_AGE)
+        peer.lnworker.uses_trampoline.return_value = False
+        return peer
+
+    async def test_peer_asked_for_a_part_of_the_backlog_counts_the_updates_of_that_part(self):
+        peer = self._peer_for_gossip_handlers()
+        start, duration = self.NOW - 48 * 3600, 24 * 3600
+        Peer.request_gossip(peer, start, duration)
+        peer.send_message.assert_called_once()
+        self.assertEqual((start, duration), (peer.send_message.call_args.kwargs['first_timestamp'],
+                                             peer.send_message.call_args.kwargs['timestamp_range']))
+        for timestamp in [start - 1, start, start + duration - 1, start + duration, self.NOW - 3600]:
+            Peer.on_channel_update(peer, {'timestamp': timestamp})
+        self.assertEqual(2, peer.num_gossip_backlog_updates_received)
+
+    async def test_peer_counts_the_updates_that_are_too_old_to_be_news(self):
+        news_start = self.NOW - Peer.GOSSIP_NEWS_MAX_AGE
+        peer = self._peer_for_gossip_handlers()
+        Peer.request_gossip(peer, self.NOW - 3600)
+        for timestamp in [self.NOW - 3601,  # we did not ask for it: the other policy of a channel that got updated
+                          self.NOW - 3600, news_start - 1,
+                          news_start, self.NOW]:  # might be news
+            Peer.on_channel_update(peer, {'timestamp': timestamp})
+        self.assertEqual(5, peer.num_gossip_msgs_received)
+        self.assertEqual(2, peer.num_gossip_backlog_updates_received)
+        # replies to our queries for channels have old updates as well
+        peer.is_querying_short_channel_ids = True
+        Peer.on_channel_update(peer, {'timestamp': self.NOW - 3600})
+        self.assertEqual(2, peer.num_gossip_backlog_updates_received)
+        peer.is_querying_short_channel_ids = False
+        # asking again starts the count again
+        self.now += 3600
+        Peer.request_gossip(peer, self.NOW)
+        self.assertEqual(0, peer.num_gossip_backlog_updates_received)
+        Peer.on_channel_update(peer, {'timestamp': self.NOW})
+        self.assertEqual(1, peer.num_gossip_backlog_updates_received)
+
+    async def test_peer_counts_the_updates_we_did_not_ask_for(self):
+        peer = self._peer_for_gossip_handlers()
+        start, duration = self.NOW - 48 * 3600, 24 * 3600
+        Peer.request_gossip(peer, start, duration)
+        for timestamp in [start - 1, start + duration, self.NOW]:
+            Peer.on_channel_update(peer, {'timestamp': timestamp})
+        Peer.on_channel_update(peer, {'timestamp': start + 1})
+        self.assertEqual((3, 1), (peer.num_gossip_updates_not_asked_for, peer.num_gossip_backlog_updates_received))
+        # replies to our queries for channels are what we asked for, whatever their age
+        peer.is_querying_short_channel_ids = True
+        Peer.on_channel_update(peer, {'timestamp': start - 1})
+        self.assertEqual(3, peer.num_gossip_updates_not_asked_for)
+        peer.is_querying_short_channel_ids = False
+        Peer.request_gossip(peer, self.NOW - 3600)
+        self.assertEqual(0, peer.num_gossip_updates_not_asked_for)
+        Peer.on_channel_update(peer, {'timestamp': self.NOW - 3601})
+        Peer.on_channel_update(peer, {'timestamp': self.NOW + 60})  # no end: new gossip is asked for
+        self.assertEqual(1, peer.num_gossip_updates_not_asked_for)
+
+    async def test_peer_asked_only_for_new_gossip_has_no_updates_too_old_to_be_news(self):
+        peer = self._peer_for_gossip_handlers()
+        Peer.request_gossip(peer, self.NOW)
+        for timestamp in [self.NOW - 3600, self.NOW - 60, self.NOW, self.NOW + 60]:
+            Peer.on_channel_update(peer, {'timestamp': timestamp})
+        self.assertEqual(4, peer.num_gossip_msgs_received)
+        self.assertEqual(0, peer.num_gossip_backlog_updates_received)
+
+    async def test_gossip_we_asked_for_is_taken_in_without_the_delay_between_messages(self):
+        async def read_messages():
+            for msg in [b'gossip', b'other', b'gossip', b'gossip']:
+                yield msg
+        peer = mock.Mock(num_gossip_msgs_received=0, DELAY_INC_MSG_PROCESSING_SLEEP=Peer.DELAY_INC_MSG_PROCESSING_SLEEP,
+                         RECV_GOSSIP_QUEUE_SOFT_MAXSIZE=Peer.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE)
+        peer.initialize = mock.AsyncMock()
+        peer.transport.read_messages = read_messages
+        peer.recv_gossip_queue.qsize.return_value = 0
+        async def _process_message(msg):
+            if msg == b'gossip':
+                peer.num_gossip_msgs_received += 1
+        peer._process_message = _process_message
+        delays = []
+        async def sleep(delay):
+            delays.append(delay)
+        with mock.patch('asyncio.sleep', sleep):
+            await Peer._message_loop(peer)
+        self.assertEqual([0, Peer.DELAY_INC_MSG_PROCESSING_SLEEP, 0, 0], delays)
+        peer._gossip_batch_is_large.set.assert_not_called()
+        # once the queue is half full, the batch does not wait any longer to be processed
+        peer.recv_gossip_queue.qsize.return_value = Peer.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE // 2
+        with mock.patch('asyncio.sleep', sleep):
+            await Peer._message_loop(peer)
+        self.assertEqual(3, peer._gossip_batch_is_large.set.call_count)  # for the gossip messages
+
+    async def test_ping_that_asks_for_no_more_than_it_sends_is_answered_without_delay(self):
+        peer = mock.Mock(_last_ping_recv_time=0, our_gossip_timestamp_filter=object())
+        peer.transport.send_bytes_and_drain = mock.AsyncMock()
+        delays = []
+        async def sleep(delay):
+            delays.append(delay)
+        with mock.patch('asyncio.sleep', sleep):
+            # e.g. LDK sends such a ping after every 32 gossip messages, and waits for the pong
+            for _ in range(3):
+                await Peer.on_ping(peer, {'num_pong_bytes': 64, 'byteslen': 64})
+            self.assertEqual([], delays)
+            self.assertEqual(3, peer.transport.send_bytes_and_drain.await_count)
+            await Peer.on_ping(peer, {'num_pong_bytes': 65, 'byteslen': 64})
+            self.assertEqual(1, len(delays))
+            self.assertEqual(4, peer.transport.send_bytes_and_drain.await_count)
+            # the peers of a wallet, and peers we did not ask for gossip, keep the limit
+            peer.our_gossip_timestamp_filter = None
+            await Peer.on_ping(peer, {'num_pong_bytes': 64, 'byteslen': 64})
+            self.assertEqual(2, len(delays))
+
+    async def test_empty_db_requests_only_new_gossip(self):
+        g = self._lngossip()
+        a = self._connect(g, 'a')
+        self.assertEqual([self.NOW], a.requested)  # the channels get queried in full, as they are not known
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertFalse(g.is_caught_up())  # a peer that just connected needs a moment to tell which channels exist
+        g.unknown_ids = {b'\x01' * 8}
+        self._tick(g, {a: self.BUSY}, times=5)
+        self.assertFalse(g.is_caught_up())
+        g.unknown_ids = set()
+        self._tick(g, {a: self.BUSY})
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual([self.now], self.saved)
+        self.assertEqual([self.NOW], a.requested)
+
+    async def test_db_without_record_asks_few_peers_for_backlog_since_before_its_newest_update(self):
+        latest_ts = self.NOW - 12 * 3600
+        g = self._lngossip(latest_ts=latest_ts)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self.assertEqual(LNGossip.GOSSIP_BACKLOG_NUM_PEERS, 2)
+        self.assertEqual([latest_ts - LNGossip.GOSSIP_BACKLOG_MARGIN], a.requested)
+        self.assertEqual([latest_ts - LNGossip.GOSSIP_BACKLOG_MARGIN], b.requested)
+        self.assertEqual([self.NOW], c.requested)  # further peers would mostly resend the same backlog
+        self.assertEqual([0xFFFFFFFF], c.requested_ranges)
+
+    async def test_backlog_starts_before_the_time_until_which_we_were_synced(self):
+        # A session that got interrupted before it caught up leaves fresh updates in the db,
+        # but did not get the older ones.
+        synced_until = self.NOW - 12 * 3600
+        g = self._lngossip(latest_ts=self.NOW - 60, synced_until=synced_until)
+        a = self._connect(g, 'a')
+        self.assertEqual([synced_until - LNGossip.GOSSIP_SYNCED_MARGIN], a.requested)
+
+    async def test_backlog_start_does_not_move_while_catching_up(self):
+        synced_until = self.NOW - 12 * 3600
+        g = self._lngossip(synced_until=synced_until)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY}, times=4)
+        b = self._connect(g, 'b')
+        self.assertEqual(a.requested, b.requested)
+        self.assertEqual([], self.saved)
+
+    async def test_backlog_is_not_older_than_max_age(self):
+        g = self._lngossip(latest_ts=self.NOW - 10 * LNGossip.max_age)
+        self.assertEqual([self.NOW - LNGossip.max_age], self._connect(g, 'a').requested)
+        g = self._lngossip(synced_until=self.NOW - 10 * LNGossip.max_age)
+        self.assertEqual([self.NOW - LNGossip.max_age], self._connect(g, 'a').requested)
+
+    async def test_record_from_the_future_is_not_trusted(self):
+        g = self._lngossip(synced_until=self.NOW + 24 * 3600)  # the clock was wrong then, or is now
+        self.assertEqual([self.NOW - LNGossip.GOSSIP_SYNCED_MARGIN], self._connect(g, 'a').requested)
+
+    async def test_caught_up_once_the_peers_asked_for_the_backlog_get_quiet(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY, c: self.QUIET}, times=2)
+        self._tick(g, {a: self.QUIET, b: self.QUIET, c: self.QUIET}, times=self.QUIET_TICKS - 1)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual([], self.saved)
+        self._tick(g, {a: self.QUIET, b: self.QUIET, c: self.QUIET})
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual([self.now], self.saved)
+        self.assertTrue(a.is_connected and b.is_connected and c.is_connected)
+        # peers that connect later are only asked for new gossip
+        self.assertEqual([self.now], self._connect(g, 'd').requested)
+
+    async def test_rate_just_above_the_quiet_one_is_not_quiet(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.QUIET + 1}, times=5)
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, {a: self.QUIET}, times=self.QUIET_TICKS)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_peer_that_just_got_asked_for_the_backlog_is_not_quiet_yet(self):
+        g = self._lngossip(synced_until=self.NOW - 3600, num_policies=0)
+        a = self._connect(g, 'a')
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertFalse(g.is_caught_up())  # it might not have started to send
+        self._tick(g)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_not_caught_up_without_any_peer(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        g._set_up_gossip_sync()
+        self._tick(g, times=10)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual([], self.saved)
+
+    async def test_peer_that_leaves_before_it_sent_the_backlog_gets_replaced(self):
+        synced_until = self.NOW - 3600
+        backlog_start = synced_until - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=synced_until)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self.assertEqual([self.NOW], c.requested)
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        a.close_and_cleanup()
+        # c is already connected, and we might not connect to more peers. ask it with a new filter
+        self._tick(g, {b: self.BUSY})
+        self.assertEqual([self.NOW, backlog_start], c.requested)
+        b.close_and_cleanup()
+        d = self._connect(g, 'd')
+        self.assertEqual([backlog_start], d.requested)
+        self.assertEqual([self.now], self._connect(g, 'e').requested)  # two peers are asked again
+        self._tick(g, {c: self.BUSY, d: self.BUSY}, times=2)
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_peer_that_resends_the_channels_we_pruned_gets_dropped_and_replaced(self):
+        # Some nodes answer every gossip_timestamp_filter, also one that asks only for the news, with the
+        # announcements of the channels they have no recent policy for: megabytes, every time.
+        synced_until = self.NOW - 3600
+        backlog_start = synced_until - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=synced_until)
+        g.GOSSIP_BACKLOG_NUM_PEERS = 1
+        pruned = {i.to_bytes(8, 'big') for i in range(1, LNGossip.GOSSIP_MAX_PRUNED_CHANS_ANNOUNCED + 1)}
+        g.channel_db.is_recently_orphaned = lambda short_channel_id: short_channel_id in pruned
+        a, b = self._connect(g, 'a'), self._connect(g, 'b')
+        self.assertEqual(([backlog_start], [self.NOW]), (a.requested, b.requested))
+        # a channel we did not prune does not count
+        self.assertFalse(g.on_channel_announced(a, b'\xff' * 8))
+        self.assertEqual(set(), a.pruned_chans_announced)
+        # nor does one that comes with a policy that is not expired: it is alive
+        first, *others = sorted(pruned)
+        self.assertFalse(g.on_channel_announced(a, first))
+        g.on_channel_update_of_announced(a, {'short_channel_id': first, 'timestamp': self.now - g.max_age - 1})
+        self.assertEqual({first}, a.pruned_chans_announced)  # (an expired one: we would prune it again)
+        g.on_channel_update_of_announced(a, {'short_channel_id': first, 'timestamp': self.now - g.max_age})
+        self.assertEqual(set(), a.pruned_chans_announced)
+        for short_channel_id in others:
+            self.assertFalse(g.on_channel_announced(a, short_channel_id))
+            self.assertFalse(g.on_channel_announced(a, short_channel_id))  # (the same one again)
+        g.channel_db.avoid_peer.assert_not_called()
+        self.assertTrue(g.on_channel_announced(a, first))
+        # it would do the same in the next session: it is not taken as a peer again for a while
+        g.channel_db.avoid_peer.assert_called_once_with(a.pubkey)
+        self.assertEqual(1, g._num_peers_resending_pruned_chans)
+        a.close_and_cleanup()  # (Peer.on_channel_announcement raises GracefulDisconnect)
+        # the other peer gets asked for the backlog in the next tick, not after the time a silent peer is given
+        self._tick(g)
+        self.assertEqual([self.NOW, backlog_start], b.requested)
+        b.close_and_cleanup()
+        self.assertEqual([self.now], self._connect(g, 'a').requested)  # if it comes back: the news only
+        self.assertEqual([backlog_start], self._connect(g, 'c').requested)
+
+    async def test_peer_tells_the_channels_it_announces_and_leaves_if_told_so(self):
+        short_channel_id = b'\x01' * 8
+        gossip = mock.Mock()
+        gossip.on_channel_announced.return_value = False
+        peer = mock.Mock(
+            # (a query for channels can take a minute, and the peer may send thousands of others meanwhile)
+            is_querying_short_channel_ids=True, recv_gossip_queue=asyncio.Queue(), num_gossip_msgs_received=0,
+            num_gossip_updates_not_asked_for=0, num_gossip_backlog_updates_received=0, _gossip_news_start=0,
+            pruned_chans_announced=set(), _queried_short_channel_ids={b'\x02' * 8})
+        peer.lnworker.uses_trampoline.return_value = False
+        peer.network.lngossip = gossip
+        Peer.on_channel_announcement(peer, {'short_channel_id': b'\x02' * 8})  # one we asked it for
+        gossip.on_channel_announced.assert_not_called()
+        Peer.on_channel_announcement(peer, {'short_channel_id': short_channel_id})
+        gossip.on_channel_announced.assert_called_once_with(peer, short_channel_id)
+        gossip.on_channel_announced.return_value = True
+        with self.assertRaises(GracefulDisconnect):
+            Peer.on_channel_announcement(peer, {'short_channel_id': short_channel_id})
+        self.assertEqual(3, peer.recv_gossip_queue.qsize())
+        # its policies are told while a channel waits for one
+        update = {'short_channel_id': short_channel_id, 'timestamp': 0}
+        Peer.on_channel_update(peer, update)
+        gossip.on_channel_update_of_announced.assert_not_called()
+        peer.pruned_chans_announced.add(short_channel_id)
+        Peer.on_channel_update(peer, update)
+        gossip.on_channel_update_of_announced.assert_called_once_with(peer, update)
+
+    async def test_peer_that_sent_the_backlog_and_left_still_counts(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b = self._connect(g, 'a'), self._connect(g, 'b')
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, {b: self.BUSY}, times=self.QUIET_TICKS)
+        a.close_and_cleanup()
+        self._tick(g, times=self.QUIET_TICKS - 1)
+        self.assertFalse(g.is_caught_up())
+        self._tick(g)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_quiet_peer_that_did_not_resend_old_gossip_does_not_count(self):
+        synced_until = self.NOW - 3600
+        backlog_start = synced_until - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=synced_until)
+        # e.g. LDK does not resend anything if we ask for less than six hours
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b', resends_old_gossip=False)
+        c = self._connect(g, 'c')
+        self._tick(g, {a: self.QUIET, b: self.QUIET, c: self.QUIET}, times=self.QUIET_TICKS + 1)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual([self.NOW, backlog_start], c.requested)
+        self.assertEqual([], self.saved)
+        self._tick(g, {c: self.BUSY})
+        self._tick(g, {c: self.QUIET}, times=self.QUIET_TICKS)
+        self.assertTrue(g.is_caught_up())
+        self.assertTrue(a.is_connected and b.is_connected)
+
+    async def test_peer_that_does_not_start_to_resend_old_gossip_is_given_up_early(self):
+        self.assertLessEqual(LNGossip.GOSSIP_BACKLOG_START_TIMEOUT, 2 * self.TICK)
+        self.assertGreater(LNGossip.GOSSIP_BACKLOG_START_TIMEOUT, self.TICK)
+        backlog_start = self.NOW - 3600 - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b')
+        c = self._connect(g, 'c')
+        # of the news that a sends, the odd update is old enough to be counted
+        a.num_gossip_backlog_updates_received = 2
+        b.num_gossip_backlog_updates_received = 10  # it has started: a tenth of what we expect at least
+        self.assertEqual(100, g._min_gossip_backlog_updates(self.now + 2 * self.TICK))
+        self._tick(g, {a: self.QUIET, b: 0})
+        self.assertEqual([self.NOW], c.requested)
+        self._tick(g, {a: self.QUIET, b: 0})
+        self.assertEqual([self.NOW, backlog_start], c.requested)  # instead of a
+        self._tick(g, {c: self.BUSY})
+        self._tick(g)
+        self.assertFalse(g.is_caught_up())  # b did not send enough to count, but had its time to get quiet
+        self._tick(g, times=2)
+        self.assertTrue(g.is_caught_up())
+        # on a small network there may be nothing to resend
+        g = self._lngossip(synced_until=self.NOW - 3600, num_policies=50)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_peer_that_did_not_resend_old_gossip_is_not_asked_again(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        a.close_and_cleanup()
+        self._tick(g)
+        a2 = self._connect(g, 'a', resends_old_gossip=False)  # it reconnects
+        self.assertEqual([self.now], a2.requested)
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        self.assertEqual([self.now - (self.QUIET_TICKS + 1) * self.TICK], a2.requested)
+        self.assertFalse(g.is_caught_up())
+
+    async def test_number_of_old_updates_that_counts_as_the_backlog(self):
+        def few_old_updates(num_old_updates, **kwargs):
+            g = self._lngossip(synced_until=self.NOW - 5 * 3600, **kwargs)
+            a = self._connect(g, 'a', resends_old_gossip=False)
+            a.num_gossip_backlog_updates_received = num_old_updates
+            self._tick(g, times=self.QUIET_TICKS + 1)
+            return g.is_caught_up()
+        self.assertEqual(100, LNGossip.GOSSIP_BACKLOG_MIN_UPDATES)
+        self.assertFalse(few_old_updates(99))  # a few updates arrive late also as news
+        self.assertTrue(few_old_updates(100))
+        # a small network has few updates
+        self.assertFalse(few_old_updates(20, num_policies=2000))
+        self.assertTrue(few_old_updates(21, num_policies=2000))
+        self.assertTrue(few_old_updates(0, num_policies=90))
+
+    async def test_fewer_old_updates_are_expected_for_a_short_or_an_old_time_span(self):
+        def min_updates(*, start, end=None, num_policies=50_000):
+            g = self._lngossip(num_policies=num_policies)
+            g._gossip_backlog_start, g._gossip_backlog_end = start, end
+            return g._min_gossip_backlog_updates(self.NOW)
+        hour, day = 3600, 24 * 3600
+        news_max_age = Peer.GOSSIP_NEWS_MAX_AGE
+        self.assertEqual(0, min_updates(start=None))  # nothing to ask for
+        # Most nodes refresh the updates of their channels daily. We reckon with half of the policies
+        # in the last day, and ask for a tenth of that.
+        self.assertEqual(50_000 // 2 // 48 // 10, min_updates(start=self.NOW - news_max_age - hour // 2))
+        self.assertEqual(100, min_updates(start=self.NOW - news_max_age - 2 * hour))  # no more than that
+        # updates that could be news do not count, so there are none to expect for the last minutes
+        self.assertEqual(0, min_updates(start=self.NOW - news_max_age))
+        self.assertEqual(0, min_updates(start=self.NOW - 60))
+        self.assertEqual(17, min_updates(start=self.NOW - 2 * news_max_age))
+        # Of the days before, only the channels that were not updated since are left: a fifth of
+        # what an even spread of the policies over max_age would give. We ask for a tenth of that.
+        self.assertEqual(LNGossip.max_age, 14 * day)
+        self.assertEqual(50_000 // 5 // 14 // 10, min_updates(start=self.NOW - 3 * day, end=self.NOW - 2 * day))
+        self.assertEqual(100, min_updates(start=self.NOW - 7 * day, end=self.NOW - 3 * day))
+        # a part can span both
+        self.assertEqual(int((10_000 / 5 / 14 + 10_000 / 2 / 24) / 10),
+                         min_updates(start=self.NOW - 2 * day, end=self.NOW - 23 * hour, num_policies=10_000))
+        # on a small network a part of the backlog can have next to no updates
+        self.assertEqual(1, min_updates(start=self.NOW - 3 * day, end=self.NOW - 2 * day, num_policies=1000))
+        self.assertEqual(0, min_updates(start=self.NOW - 3 * day, end=self.NOW - 2 * day, num_policies=500))
+        self.assertEqual(2, min_updates(start=self.NOW - news_max_age - hour, num_policies=1000))
+        # (measured on mainnet with 53340 policies: 2429 old updates for a part from 6.2 to 3.1 days ago)
+        self.assertLess(min_updates(start=self.NOW - 538372, end=self.NOW - 269188, num_policies=53340 // 50), 2429 // 50)
+        self.assertEqual(0, min_updates(start=self.NOW - 538372, end=self.NOW - 269188, num_policies=53340 // 500))
+
+    async def test_peer_that_keeps_sending_after_another_sent_the_backlog_gets_disconnected(self):
+        g = self._lngossip(synced_until=self.NOW - 3 * 3600)
+        # e.g. LDK sends its whole graph, slowly, if we ask for more than the last six hours
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, {b: self.BUSY}, times=self.QUIET_TICKS)  # a has sent the backlog
+        waited = 0
+        while waited + self.TICK < LNGossip.GOSSIP_BACKLOG_GRACE_TIME:
+            self._tick(g, {b: self.BUSY})
+            waited += self.TICK
+        self.assertTrue(b.is_connected)
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, {b: self.BUSY})
+        self.assertFalse(b.is_connected)
+        self.assertTrue(g.is_caught_up())
+        self.assertTrue(a.is_connected and c.is_connected)
+        self.assertEqual([self.NOW], c.requested)
+
+    async def test_peer_asked_after_another_sent_the_backlog_gets_its_time_to_send_it(self):
+        backlog_start = self.NOW - 3 * 3600 - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=self.NOW - 3 * 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, {b: self.BUSY}, times=self.QUIET_TICKS)  # a has sent the backlog
+        first_done_time = self.now
+        self._tick(g, {b: self.BUSY}, times=2)
+        b.close_and_cleanup()
+        self._tick(g, {c: self.BUSY})
+        self.assertEqual([self.NOW, backlog_start], c.requested)
+        asked_c_time = self.now
+        while self.now + self.TICK < asked_c_time + LNGossip.GOSSIP_BACKLOG_GRACE_TIME:
+            self._tick(g, {c: self.BUSY})
+        self.assertGreater(self.now, first_done_time + LNGossip.GOSSIP_BACKLOG_GRACE_TIME)
+        self.assertTrue(c.is_connected)
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, {c: self.BUSY})
+        self.assertFalse(c.is_connected)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_no_further_peer_is_asked_long_after_one_sent_the_backlog(self):
+        g = self._lngossip(synced_until=self.NOW - 3 * 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, {b: self.BUSY}, times=self.QUIET_TICKS)  # a has sent the backlog
+        self._tick(g, {b: self.BUSY}, times=LNGossip.GOSSIP_BACKLOG_GRACE_TIME // self.TICK - 1)
+        b.close_and_cleanup()
+        self._tick(g)
+        self.assertEqual([self.NOW], c.requested)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_makes_room_for_another_peer_if_none_resends_old_gossip(self):
+        num_peers_target = lnworker.NUM_PEERS_TARGET
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        peers = [self._connect(g, character, resends_old_gossip=False) for character in 'abcdefgh'[:num_peers_target - 1]]
+        self._tick(g, times=(self.QUIET_TICKS + 1) * num_peers_target)
+        self.assertTrue(all(peer.is_connected for peer in peers))  # we still connect to more peers
+        peers.append(self._connect(g, 'z', resends_old_gossip=False))
+        self._tick(g)
+        self.assertTrue(all(peer.is_connected for peer in peers))  # z might still start to send
+        self._tick(g)
+        self.assertEqual(num_peers_target - 1, len([peer for peer in peers if peer.is_connected]))
+        self.assertFalse(g.is_caught_up())
+        y = self._connect(g, 'y')
+        self._catch_up(g, y)
+        self.assertEqual(num_peers_target - 1, len([peer for peer in peers if peer.is_connected]))
+
+    async def test_makes_room_also_if_a_peer_that_resends_no_old_gossip_reconnected(self):
+        num_peers_target = lnworker.NUM_PEERS_TARGET
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        peers = [self._connect(g, character, resends_old_gossip=False) for character in 'abcdefgh'[:num_peers_target]]
+        self._tick(g, times=self.QUIET_TICKS + 1)  # the first two are found to be useless; the others get asked
+        peers[0].close_and_cleanup()
+        peers.append(self._connect(g, 'a', resends_old_gossip=False))
+        self._tick(g, times=self.QUIET_TICKS + 2)
+        self.assertEqual(num_peers_target - 1, len([peer for peer in peers[1:] if peer.is_connected]))
+        self.assertEqual([self.now - (self.QUIET_TICKS + 2) * self.TICK], peers[-1].requested)  # it was not asked again
+
+    async def test_not_caught_up_while_fetching_or_processing_what_we_asked_for(self):
+        def quiet_ticks(g, peer):
+            self._tick(g, {peer: self.QUIET}, times=self.QUIET_TICKS + 1)
+            return g.is_caught_up()
+        def lngossip():
+            g = self._lngossip(synced_until=self.NOW - 3600)
+            a, b = self._connect(g, 'a'), self._connect(g, 'b')
+            self._tick(g, {a: self.BUSY, b: self.BUSY})
+            return g, a, b
+        with self.subTest("channels left to ask for"):
+            g, a, b = lngossip()
+            g.unknown_ids = {b'\x01' * 8}
+            self.assertFalse(quiet_ticks(g, a))
+            g.unknown_ids = set()
+            self.assertTrue(quiet_ticks(g, a))
+        with self.subTest("waiting for the reply to a query for channels"):
+            g, a, b = lngossip()
+            b.is_querying_short_channel_ids = True
+            self.assertFalse(quiet_ticks(g, a))
+            b.is_querying_short_channel_ids = False
+            self.assertTrue(quiet_ticks(g, a))
+        # a few new messages are always waiting for the next batch, or being processed
+        few = LNGossip.GOSSIP_CATCH_UP_QUIET_RATE * self.TICK
+        with self.subTest("received messages not processed yet"):
+            g, a, b = lngossip()
+            for _ in range(few // 2):
+                a.recv_gossip_queue.put_nowait(('channel_update', {}))
+                b.recv_gossip_queue.put_nowait(('channel_update', {}))
+            b.recv_gossip_queue.put_nowait(('channel_update', {}))
+            self.assertFalse(quiet_ticks(g, a))
+            b.recv_gossip_queue.get_nowait()
+            self.assertTrue(quiet_ticks(g, a))
+        with self.subTest("messages being processed"):
+            g, a, b = lngossip()
+            g._num_gossip_msgs_in_processing = few + 1
+            self.assertFalse(quiet_ticks(g, a))
+            g._num_gossip_msgs_in_processing = few
+            self.assertTrue(quiet_ticks(g, a))
+        with self.subTest("messages waiting and being processed"):
+            g, a, b = lngossip()
+            g._num_gossip_msgs_in_processing = few
+            b.recv_gossip_queue.put_nowait(('channel_update', {}))
+            self.assertFalse(quiet_ticks(g, a))
+        with self.subTest("channels left to ask for, but no peer that answers such queries"):
+            g, a, b = lngossip()
+            g.unknown_ids = {b'\x01' * 8}
+            a.answers_channel_queries = False
+            self.assertFalse(quiet_ticks(g, a))
+            b.answers_channel_queries = False
+            self.assertTrue(quiet_ticks(g, a))
+        with self.subTest("a peer we did not ask for the backlog cannot keep us from catching up"):
+            g = self._lngossip(synced_until=self.NOW - 3600)
+            a, b, c = [self._connect(g, character) for character in 'abc']
+            self._tick(g, {a: self.BUSY, b: self.BUSY, c: self.BUSY})
+            self._tick(g, {c: self.BUSY}, times=self.QUIET_TICKS)
+            self.assertTrue(g.is_caught_up())
+            self.assertTrue(c.is_connected)
+
+    async def test_process_gossip_counts_the_messages_being_processed(self):
+        g = self._lngossip()
+        seen = []
+        async def _process_gossip(*args):
+            seen.append(g._num_gossip_msgs_in_processing)
+            raise Exception("invalid gossip")
+        g._process_gossip = _process_gossip
+        await g.process_gossip([{}], [{}, {}], [{}, {}, {}])
+        self.assertEqual([6], seen)
+        self.assertEqual(0, g._num_gossip_msgs_in_processing)
+
+    async def test_node_announcement_with_invalid_signature_does_not_drop_the_rest_of_the_batch(self):
+        g = self._lngossip()
+        channel_db = g.channel_db
+        channel_db.data_loaded.wait = mock.AsyncMock()
+        def verify_node_announcement(payload):
+            if payload['invalid']:
+                raise lnworker.InvalidGossipMsg('signature failed')
+        channel_db.verify_node_announcement = verify_node_announcement
+        channel_db.add_channel_updates.return_value = mock.Mock(orphaned=[], good=[])
+        node_anns = [{'invalid': False, 'n': 1}, {'invalid': True, 'n': 2}, {'invalid': False, 'n': 3}]
+        chan_upds = [{'short_channel_id': b'\x01' * 8}]
+        await g.process_gossip([], node_anns, chan_upds)
+        channel_db.add_node_announcements.assert_called_once_with([node_anns[0], node_anns[2]])
+        channel_db.add_channel_updates.assert_called_once_with(chan_upds, max_age=LNGossip.max_age)
+
+    async def test_synced_until_follows_the_clock_once_caught_up_and_is_saved_every_minute(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        last_rx_time = self._catch_up(g, a)
+        self.assertEqual([last_rx_time], self.saved)  # not "now": no gossip arrived since
+        caught_up_at = self.now
+        self.assertEqual(60, LNGossip.GOSSIP_SYNCED_UNTIL_SAVE_INTERVAL)
+        self._tick(g, {a: self.BUSY}, times=5)  # new gossip can come in bursts as well
+        self.assertEqual([last_rx_time], self.saved)
+        self._tick(g, {a: self.BUSY})
+        self.assertEqual([last_rx_time, caught_up_at + 60], self.saved)
+        self.assertTrue(g.is_caught_up())
+        self.assertTrue(a.is_connected)
+
+    async def test_catches_up_again_after_losing_all_peers(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        self._tick(g, {a: self.QUIET}, times=2)
+        had_gossip_until = self.now
+        a.close_and_cleanup()
+        self._tick(g, times=30)
+        self.assertFalse(g.is_caught_up())
+        self.assertLessEqual(self.saved[-1], had_gossip_until)  # the record does not move while we have no gossip
+        b = self._connect(g, 'b')
+        self.assertEqual([had_gossip_until - LNGossip.GOSSIP_SYNCED_MARGIN], b.requested)
+        self.assertEqual(self._catch_up(g, b), self.saved[-1])
+
+    async def test_pause_disconnects_the_peers_until_resume_which_catches_up(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b = self._connect(g, 'a'), self._connect(g, 'b')
+        self._catch_up(g, a, b)
+        self._tick(g, {a: self.QUIET}, times=2)
+        had_gossip_until = self.now
+        self.assertFalse(g.is_paused())
+        g.pause()
+        self.assertTrue(g.is_paused())
+        self.assertTrue(g.lnpeermgr.paused)  # no new connections
+        self.assertEqual([False, False], [a.is_connected, b.is_connected])
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual(had_gossip_until, self.saved[-1])
+        num_saved = len(self.saved)
+        g.pause()  # again: nothing more
+        self.assertEqual(num_saved, len(self.saved))
+        # a connection that was being made when we got paused is closed too, and nothing is asked of it
+        late = _FakeGossipPeer('l', lnpeermgr=g.lnpeermgr, resends_old_gossip=True)
+        self._tick(g)
+        self.assertFalse(late.is_connected)
+        self.assertEqual([], late.requested)
+        # hours pass: the record of what we have does not move, and nothing counts as a suspension
+        self._tick(g, times=30)
+        self._tick(g, seconds=3 * 3600)
+        self.assertEqual(had_gossip_until, self.saved[-1])
+        self.assertFalse(g.is_caught_up())
+        g.resume()
+        self.assertFalse(g.is_paused())
+        self.assertFalse(g.lnpeermgr.paused)
+        self.assertFalse(g.is_caught_up())
+        c = self._connect(g, 'c')
+        self.assertEqual([had_gossip_until - LNGossip.GOSSIP_SYNCED_MARGIN], c.requested)
+        self.assertEqual(self._catch_up(g, c), self.saved[-1])
+        self.assertTrue(c.is_connected)
+        g.resume()  # again: nothing more
+        self.assertTrue(g.is_caught_up())
+
+    async def test_pause_while_catching_up_does_not_move_the_record_of_what_we_have(self):
+        synced_until = self.NOW - 3600
+        g = self._lngossip(synced_until=synced_until)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY})  # the backlog is still arriving
+        self.assertFalse(g.is_caught_up())
+        g.pause()
+        self.assertFalse(a.is_connected)
+        self.assertLessEqual(max(self.saved, default=synced_until), synced_until)
+        self._tick(g, times=5)
+        g.resume()
+        b = self._connect(g, 'b')
+        self.assertEqual([synced_until - LNGossip.GOSSIP_SYNCED_MARGIN], b.requested)
+        self._catch_up(g, b)
+
+    async def test_pause_before_the_db_is_loaded(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        g._gossip_sync_is_set_up = False  # as before the db is loaded
+        g.pause()
+        self.assertEqual([], self.saved)
+        self.assertFalse(g.is_caught_up())
+        g._set_up_gossip_sync()  # the db got loaded meanwhile
+        self._tick(g, times=3)
+        self.assertEqual([], self.saved)
+        g.resume()
+        a = self._connect(g, 'a')
+        self.assertEqual([self.NOW - 3600 - LNGossip.GOSSIP_SYNCED_MARGIN], a.requested)
+        self._catch_up(g, a)
+
+    async def test_peer_manager_does_not_connect_while_paused(self):
+        g = self._lngossip()
+        peermgr = g.lnpeermgr
+        tried, sleeps = [], []
+        async def get_next_peers_to_try():
+            tried.append(len(sleeps))
+            peermgr.stopping_soon = True  # ends the loop
+            return []
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 5:
+                g.resume()
+        peermgr._get_next_peers_to_try = get_next_peers_to_try
+        g.pause()
+        with mock.patch.object(lnworker.asyncio, 'sleep', sleep):
+            await peermgr._maintain_connectivity()
+        self.assertEqual([5], tried)  # only once we got resumed
+        self.assertEqual(6, len(sleeps))
+
+    async def test_app_in_the_background_pauses_the_gossip_and_catches_up_when_the_os_wakes_it_up(self):
+        # the background manager of the android app, with the gossip as it is
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        network = mock.Mock(lngossip=g)
+        job_service = mock.Mock()
+        job_service.isJobRunningInApp.return_value = False
+        manager = gossip_catch_up.BackgroundCatchUpManager(
+            SimpleConfig({'electrum_path': self.electrum_path}), job_service=job_service, context=object())
+        grace = manager.BACKGROUND_GRACE
+        with mock.patch.object(gossip_catch_up.time, 'monotonic', lambda: self.now):
+            a = self._connect(g, 'a')
+            self._catch_up(g, a)
+            manager.poll(network)
+            self.assertFalse(g.is_paused())
+            # the user leaves the app, and the OS lets it run
+            manager.set_app_in_background(True)
+            self._tick(g, {a: self.QUIET}, times=grace // self.TICK - 1)
+            manager.poll(network)
+            self.assertFalse(g.is_paused())
+            self._tick(g, {a: self.QUIET})
+            had_gossip_until = self.now
+            manager.poll(network)
+            self.assertTrue(g.is_paused())
+            self.assertFalse(a.is_connected)
+            self._tick(g, seconds=2 * 3600)
+            manager.poll(network)
+            self.assertTrue(g.is_paused())
+            job_service.finishJobInApp.assert_not_called()
+            # the job: the gossip is resumed, and the job is kept until it has caught up
+            job_service.isJobRunningInApp.return_value = True
+            manager.poll(network)
+            self.assertFalse(g.is_paused())
+            job_service.finishJobInApp.assert_not_called()
+            b = self._connect(g, 'b')
+            self.assertEqual([had_gossip_until - LNGossip.GOSSIP_SYNCED_MARGIN], b.requested)
+            self._tick(g, {b: self.BUSY})
+            manager.poll(network)
+            job_service.finishJobInApp.assert_not_called()
+            self._tick(g, times=self.QUIET_TICKS)
+            self.assertTrue(g.is_caught_up())
+            manager.poll(network)
+            job_service.finishJobInApp.assert_called_once_with()
+            self.assertFalse(g.is_paused())  # that poll does not pause it yet: the job was still there
+            # then it is paused again, until the next job or until the user comes back
+            job_service.isJobRunningInApp.return_value = False
+            manager.poll(network)
+            self.assertTrue(g.is_paused())
+            self.assertFalse(b.is_connected)
+            manager.set_app_in_background(False)
+            manager.poll(network)
+            self.assertFalse(g.is_paused())
+            self.assertFalse(g.is_caught_up())
+        entry, = gossip_catch_up.read_history(manager.config)
+        self.assertTrue(entry['in_app'])
+        self.assertTrue(entry['caught_up'])
+        self.assertEqual(manager.last_catch_up, entry)
+
+    async def test_first_sync_of_an_empty_db_interrupted_by_a_pause_catches_up_on_what_it_fetched(self):
+        # gossip got switched on: the db has no policies, so the channels get fetched in full. The user leaves
+        # the app meanwhile. The channels fetched by then are known when it resumes: their updates made while
+        # paused have to be asked for, they are not fetched again.
+        for interruption in ('pause', 'suspend'):
+            g = self._lngossip(latest_ts=None, synced_until=None)
+            g.unknown_ids = {b'\x01' * 8}  # still fetching channels
+            session_start = self.now
+            a = self._connect(g, 'a')
+            self.assertEqual([session_start], a.requested)  # only new gossip: the rest comes with the channels
+            self._tick(g, {a: self.BUSY}, times=6)
+            self.assertFalse(g.is_caught_up())
+            if interruption == 'pause':
+                g.pause()
+                self._tick(g, seconds=3 * 3600)
+                g.resume()
+            else:
+                self._tick(g, seconds=3 * 3600)  # the OS froze us
+                a.close_and_cleanup()
+            c = self._connect(g, 'c')
+            g.unknown_ids = set()
+            self.assertEqual([session_start - LNGossip.GOSSIP_SYNCED_MARGIN], c.requested, msg=interruption)
+            self._catch_up(g, c)
+
+    async def test_a_new_peer_while_an_old_one_is_there_is_no_reason_to_catch_up(self):
+        # a quiet network: no gossip for a while, but peer a was connected all along
+        g = self._lngossip(synced_until=self.NOW - 3600, num_policies=500)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        self._tick(g, {a: 0}, times=6)
+        d = self._connect(g, 'd')  # a further peer, asked for new gossip only
+        self._tick(g, {a: 0, d: 0})
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(1, len(d.requested))
+
+    async def test_peers_that_all_connected_after_we_last_had_gossip_make_us_catch_up(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b = self._connect(g, 'a'), self._connect(g, 'b')
+        self._catch_up(g, a, b)
+        self._tick(g, {a: self.QUIET, b: self.QUIET}, times=2)
+        had_gossip_until = self.now
+        a.responds = b.responds = False  # the connections died silently (e.g. the wifi got out of range)
+        self._tick(g, times=4)
+        self.assertTrue(g.is_caught_up())
+        a.close_and_cleanup()  # the ping timed out
+        self.now += 5
+        c = self._connect(g, 'c')  # its replacement, connected and asked for new gossip before the next tick
+        b.close_and_cleanup()
+        self.assertEqual([self.now], c.requested)
+        self._tick(g)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual(had_gossip_until - LNGossip.GOSSIP_SYNCED_MARGIN, c.requested[-1])
+        self.assertEqual(self._catch_up(g, c), self.saved[-1])
+        # peers that get replaced one by one while gossip goes on arriving are no reason to
+        d = self._connect(g, 'd')
+        self._tick(g, {c: self.QUIET, d: self.QUIET}, times=3)
+        c.close_and_cleanup()
+        self._tick(g, {d: self.QUIET}, times=3)
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(1, len(d.requested))
+
+    async def test_peer_that_does_not_respond_is_not_asked_again_in_the_tick_that_drops_it(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        g.GOSSIP_BACKLOG_NUM_PEERS = 1  # as in the background process
+        a = self._connect(g, 'a')
+        b = self._connect(g, 'b')
+        self.assertEqual([self.NOW], b.requested)  # one source is enough
+        self._tick(g, {a: self.BUSY})
+        a.responds = False
+        num_requests = len(a.requested)
+        while a.is_connected:
+            self._tick(g)
+        self.assertEqual(num_requests, len(a.requested))
+        self.assertEqual(2, len(b.requested))  # in that same tick, instead
+        self.assertLess(b.requested[-1], self.NOW)
+
+    async def test_catches_up_again_after_being_suspended(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._catch_up(g, a, b)
+        # a tick that is a bit late is not a suspend
+        self._tick(g, {c: self.QUIET}, seconds=self.TICK + LNGossip.GOSSIP_SUSPEND_THRESHOLD)
+        self.assertTrue(g.is_caught_up())
+        awake_until = self.now
+        expected = awake_until - LNGossip.GOSSIP_SYNCED_MARGIN
+        self.now += self.TICK + LNGossip.GOSSIP_SUSPEND_THRESHOLD + 1
+        self.assertFalse(g.is_caught_up())  # already before the tick notices
+        g._gossip_sync_tick()
+        self.assertFalse(g.is_caught_up())
+        # the connections that are still there are asked again, as they will not get replaced
+        self.assertEqual([expected], a.requested[1:])
+        self.assertEqual([expected], b.requested[1:])
+        self.assertEqual([], c.requested[1:])
+        # they turn out to be dead
+        a.close_and_cleanup()
+        b.close_and_cleanup()
+        self._tick(g)
+        self.assertEqual([expected], c.requested[1:])
+        d = self._connect(g, 'd')
+        self.assertEqual([expected], d.requested)
+        self._tick(g, {c: self.BUSY, d: self.BUSY}, times=4)
+        self.assertFalse(g.is_caught_up())
+        self.assertLessEqual(self.saved[-1], awake_until)
+        self._tick(g, {c: self.QUIET, d: self.QUIET}, times=self.QUIET_TICKS)
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(self.now, self.saved[-1])
+
+    async def test_suspend_while_catching_up_keeps_the_backlog_start(self):
+        synced_until = self.NOW - 3600
+        g = self._lngossip(synced_until=synced_until)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY}, times=4)
+        self._tick(g, seconds=8 * 3600)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual([synced_until - LNGossip.GOSSIP_SYNCED_MARGIN] * 2, a.requested)
+        self.assertEqual([], self.saved)
+        # what a sent before the suspend does not make it look busy now, nor like it resent old gossip
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        self.assertFalse(g.is_caught_up())
+        b = self._connect(g, 'b')
+        self.assertEqual(a.requested[1], b.requested[-1])
+        self._receive_backlog_in_parts(g, b)
+
+    def _receive_backlog_in_parts(self, g: LNGossip, *sources: _FakeGossipPeer, max_parts: int = 20):
+        """Returns the parts (start, end) that got asked for until we caught up. end is None for the last one."""
+        parts = []
+        num_requested_before = len(sources[0].requested) - 1
+        for _ in range(max_parts):
+            start, duration = sources[0].requested[-1], sources[0].requested_ranges[-1]
+            for peer in sources[1:]:
+                self.assertEqual((start, duration), (peer.requested[-1], peer.requested_ranges[-1]))
+            parts.append((start, start + duration if duration != 0xFFFFFFFF else None))
+            self._tick(g, {peer: self.BUSY for peer in sources})
+            self._tick(g, times=self.QUIET_TICKS)
+            if g.is_caught_up():
+                return parts
+            self.assertEqual(num_requested_before + len(parts) + 1, len(sources[0].requested))
+        self.fail("did not catch up")
+
+    async def test_long_backlog_is_asked_for_in_parts_and_progress_is_recorded(self):
+        max_last_part = LNGossip.GOSSIP_BACKLOG_LAST_PART_MAX_DURATION
+        self.assertEqual(6 * 3600, max_last_part)
+        start = self.NOW - 40 * 3600
+        g = self._lngossip(synced_until=start + LNGossip.GOSSIP_SYNCED_MARGIN)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self.assertEqual(([self.NOW], [0xFFFFFFFF]), (c.requested, c.requested_ranges))  # new gossip meanwhile
+        parts = self._receive_backlog_in_parts(g, a, b)
+        # the older half of what is left each time: 20h, 10h, 5h, and the rest
+        self.assertEqual(4, len(parts))
+        self.assertEqual((start, start + 20 * 3600), parts[0])
+        for (start1, end1), (start2, end2) in zip(parts, parts[1:]):
+            self.assertEqual(end1, start2)  # no gaps
+            self.assertGreater(end1 - start1, max_last_part // 2)
+        last_start, last_end = parts[-1]
+        self.assertIsNone(last_end)  # followed by the new gossip
+        self.assertLessEqual(self.NOW - last_start, max_last_part)
+        self.assertGreater(self.NOW - last_start, max_last_part // 2)
+        # how far we got is recorded after each part, and in the end the time gossip last arrived
+        self.assertEqual([end for start, end in parts[:-1]] + [self.now - self.QUIET_TICKS * self.TICK], self.saved)
+        self.assertEqual([self.NOW], c.requested)
+        self.assertTrue(a.is_connected and b.is_connected and c.is_connected)
+
+    async def test_backlog_of_a_few_hours_is_asked_for_at_once(self):
+        start = self.NOW - LNGossip.GOSSIP_BACKLOG_LAST_PART_MAX_DURATION
+        g = self._lngossip(synced_until=start + LNGossip.GOSSIP_SYNCED_MARGIN)
+        a = self._connect(g, 'a')
+        self.assertEqual([(start, None)], self._receive_backlog_in_parts(g, a))
+        g = self._lngossip(synced_until=start - 1 + LNGossip.GOSSIP_SYNCED_MARGIN)
+        a = self._connect(g, 'a')
+        self.assertEqual(2, len(self._receive_backlog_in_parts(g, a)))
+
+    async def test_interrupted_long_catch_up_goes_on_from_the_last_part_received(self):
+        start = self.NOW - 48 * 3600
+        g = self._lngossip(synced_until=start + LNGossip.GOSSIP_SYNCED_MARGIN)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY})
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertEqual([start + 24 * 3600], self.saved)
+        self._tick(g, {a: self.BUSY})  # the OS kills us while we receive the second part
+        g2 = self._lngossip(latest_ts=self.now, synced_until=self.saved[-1])
+        a2 = self._connect(g2, 'a')
+        self.assertEqual([start + 24 * 3600 - LNGossip.GOSSIP_SYNCED_MARGIN], a2.requested)
+        self.assertNotEqual([0xFFFFFFFF], a2.requested_ranges)  # still more than a few hours to go
+
+    async def test_next_part_is_asked_from_another_peer_if_the_one_that_sent_the_last_part_left(self):
+        g = self._lngossip(synced_until=self.NOW - 48 * 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        a.close_and_cleanup()
+        self._tick(g, {b: self.BUSY})  # c is asked instead of a
+        self._tick(g, {c: self.BUSY})
+        b.close_and_cleanup()
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertEqual(1, len(self.saved))
+        self.assertEqual([self.NOW, c.requested[1], self.saved[0]], c.requested)
+        parts = self._receive_backlog_in_parts(g, c)
+        self.assertEqual(self.saved[0], parts[0][0])
+
+    async def test_peer_without_old_gossip_for_a_part_is_replaced_for_that_part(self):
+        g = self._lngossip(synced_until=self.NOW - 48 * 3600)
+        a, b, c = [self._connect(g, character) for character in 'abc']
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertEqual(2, len(a.requested))
+        a._resends_old_gossip = b._resends_old_gossip = False
+        self._tick(g, times=2)
+        self.assertEqual([self.NOW, a.requested[1]], c.requested)
+        self.assertEqual(a.requested_ranges[1], c.requested_ranges[1])
+        self.assertNotEqual(0xFFFFFFFF, c.requested_ranges[1])
+        self.assertEqual(1, len(self.saved))
+        # a and b were asked for a time span in the past, which has no new gossip. they get to send that again
+        for peer in (a, b):
+            self.assertEqual((self.now, 0xFFFFFFFF), (peer.requested[-1], peer.requested_ranges[-1]))
+            self.assertEqual(3, len(peer.requested))
+            self.assertTrue(peer.is_connected)
+        # c sends the rest, in parts
+        parts = self._receive_backlog_in_parts(g, c)
+        self.assertEqual(self.saved[0], parts[0][0])
+        self.assertEqual(3, len(a.requested))
+
+    async def test_tick_survives_peers_that_are_connecting_while_we_have_enough_of_them(self):
+        # peers are counted from the moment we start to connect to them, and send gossip only later
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        g._set_up_gossip_sync()
+        connecting = []
+        for character in 'abcdefgh'[:lnworker.NUM_PEERS_TARGET]:
+            peer = _FakeGossipPeer(character, lnpeermgr=g.lnpeermgr, resends_old_gossip=True)
+            peer.our_gossip_timestamp_filter = None
+            connecting.append(peer)
+        self._tick(g, times=3)
+        self.assertFalse(g.is_caught_up())
+        self.assertTrue(all(peer.is_connected for peer in connecting))
+
+    async def test_failing_tick_does_not_stop_the_other_maintenance(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        g.channel_db.data_loaded.wait = mock.AsyncMock()
+        ticks = []
+        def tick():
+            ticks.append(1)
+            if len(ticks) == 1:
+                raise Exception("bug")
+            if len(ticks) == 3:
+                raise asyncio.CancelledError()
+        g._gossip_sync_tick = tick
+        sleep = asyncio.sleep
+        with mock.patch('asyncio.sleep', lambda delay: sleep(0)):
+            with self.assertRaises(asyncio.CancelledError):
+                await g._maintain_gossip_sync()
+        self.assertEqual(3, len(ticks))
+
+    async def test_gossip_sync_is_maintained_once_the_network_is_started(self):
+        g = self._lngossip()
+        g.lnpeermgr.start_network = mock.Mock()
+        spawned = []
+        async def spawn(coro):
+            spawned.append(coro.__name__)
+            coro.close()
+        g.taskgroup.spawn = spawn
+        g.main_loop = mock.AsyncMock()
+        g.start_network(mock.Mock())
+        await asyncio.sleep(0.05)
+        self.assertIn('_maintain_gossip_sync', spawned)
+
+    async def test_peer_that_stopped_responding_is_not_taken_for_one_that_sent_everything(self):
+        backlog_start = self.NOW - 3600 - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY})
+        self.assertEqual(0, a.num_pings)
+        a.responds = False  # e.g. the network stalls in the middle of the backlog
+        self._tick(g)
+        self.assertEqual(1, a.num_pings)  # it sends little: has it sent everything? a pong will tell
+        self._tick(g, times=self.QUIET_TICKS - 1)
+        self.assertEqual(1, a.num_pings)
+        self.assertFalse(g.is_caught_up())  # it is as quiet as a peer that sent everything, but there was no pong
+        self.assertEqual([], self.saved)
+        self.assertGreaterEqual(self.QUIET_TICKS * self.TICK, LNGossip.GOSSIP_BACKLOG_PONG_TIMEOUT)
+        self.assertFalse(a.is_connected)
+        # the node was not found to be useless, only the connection was dead
+        a2 = self._connect(g, 'a')
+        self.assertEqual([backlog_start], a2.requested)
+        self._catch_up(g, a2)
+
+    async def test_peer_that_sends_slowly_and_then_stalls_is_not_taken_for_one_that_sent_everything(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        slow = 2 * self.QUIET  # per tick: twice the rate of a quiet peer
+        self._tick(g, {a: slow}, times=self.QUIET_TICKS + 1)
+        self.assertFalse(g.is_caught_up())
+        a.responds = False
+        for _ in range(self.QUIET_TICKS + 3):
+            self._tick(g)
+            self.assertFalse(g.is_caught_up())
+            self.assertEqual([], self.saved)
+        self.assertFalse(a.is_connected)
+
+    async def test_peer_that_gets_busy_again_is_pinged_again_once_it_sends_little(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY})
+        self._tick(g)
+        self.assertEqual(1, a.num_pings)
+        self._tick(g, {a: self.BUSY})  # it was a pause
+        self._tick(g)
+        self.assertEqual(2, a.num_pings)
+        self._tick(g, times=self.QUIET_TICKS - 1)
+        self.assertEqual(2, a.num_pings)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_dead_connection_asked_after_a_suspend_does_not_make_the_node_useless(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        a.responds = False
+        self._tick(g, seconds=3600)  # the suspend. a is asked again, over a connection that is dead
+        self.assertEqual(2, len(a.requested))
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        self.assertFalse(a.is_connected)
+        a2 = self._connect(g, 'a')
+        self.assertEqual(a.requested[1], a2.requested[0])  # the node is asked again
+
+    async def test_synced_until_does_not_move_while_no_gossip_arrives(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        self._tick(g, {a: self.QUIET}, times=6)
+        had_gossip_until = self.now
+        self.assertEqual(had_gossip_until, self.saved[-1])
+        # the connection is there, but nothing comes in: e.g. it died silently
+        max_silence = LNGossip.GOSSIP_MAX_SILENCE
+        self._tick(g, times=max_silence // self.TICK)
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(had_gossip_until, max(self.saved))
+        self.assertEqual([self.NOW - 3600 - LNGossip.GOSSIP_SYNCED_MARGIN], a.requested)
+        # after a while we catch up again: a is asked first, and if it has nothing, others will be
+        self._tick(g)
+        self.assertFalse(g.is_caught_up())
+        self.assertEqual(had_gossip_until - LNGossip.GOSSIP_SYNCED_MARGIN, a.requested[-1])
+        self.assertEqual(had_gossip_until, max(self.saved))
+
+    async def test_silence_is_normal_on_a_small_network(self):
+        g = self._lngossip(synced_until=self.NOW - 3600, num_policies=9_999)
+        a = self._connect(g, 'a')
+        last_rx_time = self._catch_up(g, a)
+        self._tick(g, times=10 * LNGossip.GOSSIP_MAX_SILENCE // self.TICK)
+        self.assertTrue(g.is_caught_up())
+        self.assertEqual(1, len(a.requested))
+        self.assertEqual(last_rx_time, max(self.saved))  # which costs a longer backlog next time, of few updates
+
+    async def test_peer_that_sends_what_we_did_not_ask_for_instead_of_the_backlog_gets_disconnected(self):
+        min_num, max_ratio = LNGossip.GOSSIP_BACKLOG_MIN_UPDATES_NOT_ASKED_FOR, LNGossip.GOSSIP_BACKLOG_MAX_RATIO_NOT_ASKED_FOR
+        def lngossip():
+            g = self._lngossip(synced_until=self.NOW - 48 * 3600)
+            return g, self._connect(g, 'a'), self._connect(g, 'b', resends_old_gossip=False)
+        # lnd also sends the other direction of each channel that got updated, whatever its age
+        g, a, b = lngossip()
+        b.num_gossip_backlog_updates_received = 10 * min_num
+        b.num_gossip_updates_not_asked_for = 10 * min_num
+        self._tick(g, {a: self.BUSY, b: self.BUSY}, times=3)
+        self.assertTrue(b.is_connected)
+        # e.g. LDK sends its whole graph if we ask for anything older than six hours
+        g, a, b = lngossip()
+        b.num_gossip_backlog_updates_received = min_num // max_ratio
+        b.num_gossip_updates_not_asked_for = min_num
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self.assertTrue(b.is_connected)  # just not more than that
+        b.num_gossip_updates_not_asked_for += 1
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self.assertFalse(b.is_connected)
+        self.assertTrue(a.is_connected)
+        b2 = self._connect(g, 'b', resends_old_gossip=False)
+        self.assertEqual([self.now], b2.requested)  # it is not asked again
+        # too few to tell
+        g, a, b = lngossip()
+        b.num_gossip_backlog_updates_received = 1
+        b.num_gossip_updates_not_asked_for = min_num - 1
+        self._tick(g, {a: self.BUSY, b: self.BUSY}, times=3)
+        self.assertTrue(b.is_connected)
+
+    async def test_peer_is_not_given_up_early_while_it_answers_our_query_for_channels(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b')
+        c = self._connect(g, 'c')
+        a.is_querying_short_channel_ids = True  # its updates are not counted meanwhile
+        self._tick(g, {a: self.BUSY, b: self.BUSY}, times=4)
+        self.assertEqual([self.NOW], c.requested)
+        a.is_querying_short_channel_ids = False
+        self._tick(g)
+        self.assertEqual(2, len(c.requested))  # now it is: it had its time and sent no old updates
+
+    async def test_channels_are_not_queried_from_the_peer_that_resends_old_gossip_nor_from_useless_ones(self):
+        ids = {bytes([i]) * 8 for i in range(3)}
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b')
+        c = self._connect(g, 'c')
+        d = self._connect(g, 'd')
+        g.unknown_ids = set(ids)
+        self.assertEqual([], g.get_ids_to_query(a))  # while it resends old gossip we tell that by what it sends
+        self.assertEqual([], g.get_ids_to_query(b))
+        self.assertEqual(ids, g.unknown_ids)
+        self._tick(g, {b: self.BUSY}, times=2)  # a is given up, and c is asked instead
+        self.assertEqual(2, len(c.requested))
+        self.assertEqual([], g.get_ids_to_query(a))  # such peers mostly do not answer these queries either
+        self.assertEqual([], g.get_ids_to_query(c))
+        self.assertEqual(ids, set(g.get_ids_to_query(d)))
+        self.assertEqual(set(), g.unknown_ids)
+        g.unknown_ids = set(ids)
+        self._tick(g, {c: self.BUSY})
+        self._tick(g, times=self.QUIET_TICKS + 1)
+        self.assertFalse(g.is_caught_up())  # channels left to ask for
+        self.assertEqual(ids, set(g.get_ids_to_query(b)))  # it has sent the old gossip
+        self._tick(g)
+        self.assertTrue(g.is_caught_up())
+        g.unknown_ids = set(ids)
+        self.assertEqual(ids, set(g.get_ids_to_query(a)))  # afterwards any peer is asked, as before
+
+    async def test_useless_peer_is_queried_for_channels_if_no_other_peer_would_answer(self):
+        ids = {bytes([i]) * 8 for i in range(3)}
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b')
+        self._tick(g, {b: self.BUSY}, times=2)  # a is given up
+        g.unknown_ids = set(ids)
+        self.assertEqual([], g.get_ids_to_query(a))  # b will be asked once it has sent the backlog
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertFalse(g.is_caught_up())
+        b.close_and_cleanup()
+        c = self._connect(g, 'c')
+        c.answers_channel_queries = False  # it timed out on a query
+        self._tick(g, {c: self.BUSY})
+        self._tick(g, times=self.QUIET_TICKS)
+        self.assertFalse(g.is_caught_up())  # a answers such queries
+        self.assertEqual(ids, set(g.get_ids_to_query(a)))
+        self._tick(g)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_gossip_missed_while_without_peers_is_asked_for_also_if_we_were_about_to_catch_up(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a, b = self._connect(g, 'a'), self._connect(g, 'b')
+        self._tick(g, {a: self.BUSY, b: self.BUSY})
+        self._tick(g, {b: self.BUSY}, times=self.QUIET_TICKS)  # a has sent the backlog, b is still sending
+        self.assertFalse(g.is_caught_up())
+        last_rx_time = self.now
+        a.close_and_cleanup()
+        b.close_and_cleanup()  # e.g. the phone leaves the wifi. the process is not suspended
+        self._tick(g, times=180)  # half an hour without peers
+        self.assertFalse(g.is_caught_up())
+        # what we have is the gossip until it last arrived, not until now
+        self.assertEqual({last_rx_time}, set(self.saved))
+        c = self._connect(g, 'c')
+        self.assertEqual([last_rx_time - LNGossip.GOSSIP_SYNCED_MARGIN], c.requested)
+        self._catch_up(g, c)
+
+    async def test_time_until_which_we_are_synced_never_goes_back(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._catch_up(g, a)
+        self._tick(g, {a: self.QUIET}, times=3)
+        synced_until = g.get_gossip_synced_until()
+        self.assertEqual(self.now, synced_until)
+        g._gossip_last_rx_time = self.now - 1000  # whatever makes it older
+        self._tick(g)
+        self.assertEqual(synced_until, g.get_gossip_synced_until())
+
+    async def test_backlog_peer_with_a_burst_of_news_in_the_tick_we_would_judge_it_waits_for_the_next(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a')
+        self._tick(g, {a: self.BUSY}, times=2)
+        self._tick(g, {a: self.QUIET // 4}, times=2)  # it sends little: pinged
+        self.assertEqual(1, a.num_pings)
+        # Over the last three ticks it is quiet, but not in the last one, which made us forget the ping.
+        self._tick(g, {a: self.QUIET + 100})
+        self.assertFalse(g.is_caught_up())
+        self._tick(g, {a: self.QUIET // 4}, times=self.QUIET_TICKS)
+        self.assertEqual(2, a.num_pings)
+        self.assertTrue(g.is_caught_up())
+
+    async def test_send_ping_sends_a_ping(self):
+        peer = mock.Mock()
+        Peer.send_ping(peer)
+        peer.send_message.assert_called_once_with('ping', num_pong_bytes=4, byteslen=4)
+
+    async def test_connected_peer_is_not_asked_for_the_backlog_during_a_query_for_channels(self):
+        backlog_start = self.NOW - 3600 - LNGossip.GOSSIP_SYNCED_MARGIN
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b', resends_old_gossip=False)
+        c = self._connect(g, 'c')
+        c.is_querying_short_channel_ids = True  # the reply consists of old gossip as well
+        self._tick(g, times=4)
+        self.assertEqual([self.NOW], c.requested)
+        c.is_querying_short_channel_ids = False
+        self._tick(g)
+        self.assertEqual([self.NOW, backlog_start], c.requested)
+
+    async def test_node_that_was_useless_is_asked_again_the_next_time_we_catch_up(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        a = self._connect(g, 'a', resends_old_gossip=False)
+        b = self._connect(g, 'b')
+        self._catch_up(g, b)
+        self.assertEqual(1, len(a.requested))
+        self._tick(g, {b: self.QUIET})
+        b.close_and_cleanup()
+        a.close_and_cleanup()
+        self._tick(g)
+        self.assertFalse(g.is_caught_up())
+        a2 = self._connect(g, 'a')  # this time it might have what we ask for
+        self.assertLess(a2.requested[0], self.now - LNGossip.GOSSIP_SYNCED_MARGIN + 60)
+        self._catch_up(g, a2)
+
+    async def test_known_channel_announcements_are_not_verified_again(self):
+        g = self._lngossip()
+        channel_db = g.channel_db
+        channel_db.data_loaded.wait = mock.AsyncMock()
+        known, new = b'\x01' * 8, b'\x02' * 8
+        channel_db.get_channel_ids = lambda: {ShortChannelID(known)}
+        channel_db.get_recently_orphaned_among = lambda scids: set()
+        channel_db.add_channel_updates.return_value = mock.Mock(orphaned=[], good=[])
+        chan_anns = [{'short_channel_id': known}, {'short_channel_id': new}]
+        await g.process_gossip(chan_anns, [], [])
+        channel_db.verify_channel_announcement.assert_called_once_with(chan_anns[1])
+        channel_db.add_channel_announcements.assert_called_once_with([chan_anns[1]])
+
+    async def test_stop_waits_for_the_record_to_be_written(self):
+        g = self._lngossip(synced_until=self.NOW - 3600)
+        self._catch_up(g, self._connect(g, 'a'))
+        g.lnpeermgr.stop = mock.AsyncMock()
+        written = util.get_asyncio_loop().create_future()
+        g.channel_db.save_synced_until = lambda ts: written
+        stopping = asyncio.create_task(g.stop())
+        await asyncio.sleep(0.05)
+        self.assertFalse(stopping.done())  # the db drops the writes still queued when it gets stopped
+        written.set_result(None)
+        await asyncio.wait_for(stopping, 5)
+
+    async def test_without_a_daemon_no_node_is_one_of_our_wallets(self):
+        g = self._lngossip()
+        g.lnpeermgr.network.daemon = None  # as when only catching up on gossip
+        self.assertFalse(g.lnpeermgr.is_our_lnwallet(node('a')))
+        wallet = mock.Mock()
+        wallet.lnworker.node_keypair.pubkey = node('a')
+        g.lnpeermgr.network.daemon = mock.Mock(get_wallets=lambda: {'w': wallet})
+        self.assertTrue(g.lnpeermgr.is_our_lnwallet(node('a')))
+        self.assertFalse(g.lnpeermgr.is_our_lnwallet(node('b')))
+
+    async def test_large_batch_of_gossip_is_processed_without_waiting(self):
+        processed = []
+        peer = mock.Mock(recv_gossip_queue=asyncio.Queue(), _gossip_batch_is_large=asyncio.Event(),
+                         RECV_GOSSIP_QUEUE_SOFT_MAXSIZE=Peer.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE)
+        async def process_gossip(chan_anns, node_anns, chan_upds):
+            processed.append(len(chan_upds))
+            raise asyncio.CancelledError()
+        peer.network.lngossip.process_gossip = process_gossip
+        for _ in range(Peer.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE // 2):
+            peer.recv_gossip_queue.put_nowait(('channel_update', {}))
+        task = asyncio.create_task(Peer._process_gossip(peer))
+        await asyncio.sleep(0.05)
+        self.assertEqual([], processed)  # a small batch waits for more, a few seconds
+        peer._gossip_batch_is_large.set()  # what _message_loop does when the queue is half full
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        self.assertEqual([Peer.RECV_GOSSIP_QUEUE_SOFT_MAXSIZE // 2], processed)
+
+    async def test_gossip_peer_that_went_silent_gets_pinged_and_dropped_without_a_pong(self):
+        sent = []
+        peer = mock.Mock(last_message_time=self.NOW, pong_event=asyncio.Event(),
+                         GOSSIP_PEER_MAX_SILENCE=Peer.GOSSIP_PEER_MAX_SILENCE)
+        peer.send_ping = lambda: sent.append(self.now)
+        sleep = asyncio.sleep
+        async def fast_sleep(delay):
+            self.now += delay
+            await sleep(0)
+        with mock.patch('asyncio.sleep', fast_sleep), mock.patch.object(lnpeer_module, 'LN_P2P_NETWORK_TIMEOUT', 0.05):
+            with self.assertRaises(lnpeer_module.GracefulDisconnect):
+                await asyncio.wait_for(Peer._ping_when_silent(peer), 5)
+        self.assertEqual(1, len(sent))
+        self.assertGreater(sent[0] - self.NOW, Peer.GOSSIP_PEER_MAX_SILENCE)
+
+    async def test_gossip_peer_that_answers_the_ping_stays(self):
+        pings = []
+        peer = mock.Mock(last_message_time=self.NOW, pong_event=asyncio.Event(),
+                         GOSSIP_PEER_MAX_SILENCE=Peer.GOSSIP_PEER_MAX_SILENCE)
+        def send_ping():
+            pings.append(self.now)
+            if len(pings) == 3:
+                raise asyncio.CancelledError()  # enough
+            Peer.on_pong(peer, {})
+            peer.last_message_time = self.now  # as _process_message does for every message
+        peer.send_ping = send_ping
+        sleep = asyncio.sleep
+        async def fast_sleep(delay):
+            self.now += delay
+            await sleep(0)
+        with mock.patch('asyncio.sleep', fast_sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(Peer._ping_when_silent(peer), 5)
+        self.assertEqual(self.NOW + Peer.GOSSIP_PEER_MAX_SILENCE + 10, pings[0])
+        self.assertEqual(pings[1], peer.last_pong_time)  # recorded for those who wait for it
+        # pinged again only after it was silent for that long again
+        self.assertEqual([Peer.GOSSIP_PEER_MAX_SILENCE + 10] * 2, [t2 - t1 for t1, t2 in zip(pings, pings[1:])])
+
+    async def test_only_peers_that_just_send_us_gossip_are_pinged_when_silent(self):
+        async def main_loop(*, is_gossip_peer):
+            group = mock.Mock(spawn=mock.AsyncMock())
+            peer = mock.MagicMock()
+            peer.taskgroup.__aenter__ = mock.AsyncMock(return_value=group)
+            peer.taskgroup.__aexit__ = mock.AsyncMock(return_value=False)
+            peer.initialized = util.get_asyncio_loop().create_future()
+            peer.initialized.set_result(True)
+            peer.network.lngossip = peer.lnworker if is_gossip_peer else mock.Mock()
+            await Peer.main_loop(peer)
+            return peer
+        peer = await main_loop(is_gossip_peer=True)
+        peer._ping_when_silent.assert_called_once_with()
+        peer.htlc_switch.assert_not_called()
+        peer = await main_loop(is_gossip_peer=False)  # the peers of a wallet get pinged by htlc_switch
+        peer._ping_when_silent.assert_not_called()
+        peer.htlc_switch.assert_called_once_with()
+
+    async def test_stop_records_until_when_we_were_synced(self):
+        async def stop(g):
+            g.lnpeermgr.stop = mock.AsyncMock()
+            g.channel_db.save_synced_until = lambda ts: self.saved.append(ts) or util.get_asyncio_loop().create_future()
+            with mock.patch.object(lnworker, 'ignore_after', lambda secs: aiorpcx.ignore_after(0.01)):
+                await g.stop()
+        with self.subTest("caught up"):
+            g = self._lngossip(synced_until=self.NOW - 3600)
+            a = self._connect(g, 'a')
+            self._catch_up(g, a)
+            self._tick(g, {a: self.QUIET}, times=3)
+            had_gossip_until = self.now
+            self.now += 5
+            await stop(g)
+            self.assertEqual(had_gossip_until, self.saved[-1])
+        with self.subTest("stopped right after a suspend"):
+            self.saved.clear()
+            g = self._lngossip(synced_until=self.NOW - 3600)
+            a = self._connect(g, 'a')
+            self._catch_up(g, a)
+            self._tick(g, {a: self.QUIET})
+            had_gossip_until = self.now
+            self.now += 3 * 3600  # the tick has not noticed yet
+            await stop(g)
+            self.assertEqual(had_gossip_until, self.saved[-1])
+        with self.subTest("interrupted while catching up"):
+            self.saved.clear()
+            synced_until = self.NOW - 3600
+            g = self._lngossip(latest_ts=self.NOW, synced_until=synced_until)
+            a = self._connect(g, 'a')
+            self._tick(g, {a: self.BUSY}, times=5)
+            await stop(g)
+            self.assertEqual([synced_until], self.saved)
+        with self.subTest("interrupted while catching up, db without record"):
+            self.saved.clear()
+            g = self._lngossip(latest_ts=self.NOW - 3600)
+            a = self._connect(g, 'a')
+            self._tick(g, {a: self.BUSY}, times=5)
+            await stop(g)
+            self.assertEqual([], self.saved)
+        with self.subTest("stopped before the db got loaded"):
+            g = self._lngossip(synced_until=self.NOW - 3600)
+            await stop(g)
+            self.assertEqual([], self.saved)
+
+
+class TestChannelRangeMajority(ElectrumTestCase):
+
+    OLD_HEIGHT = 100
+    NUM_PEERS = LNGossip.CHANNEL_RANGE_NUM_PEERS
+
+    def _scid(self, n: int, *, height: int = OLD_HEIGHT) -> ShortChannelID:
+        return ShortChannelID.from_components(height, n, 0)
+
+    def _lngossip(self, known, *, local_height: int = 1000, recently_updated=(), latest_policy_ts=None,
+                  policy_timestamps=None):
+        removed = []
+        if latest_policy_ts is None:
+            latest_policy_ts = int(time.time())
+        if policy_timestamps is not None:
+            has_policy_newer_than = lambda scid, ts: policy_timestamps.get(scid, 0) > ts
+        else:
+            has_policy_newer_than = lambda scid, ts: scid in recently_updated
+        g = mock.Mock(
+            spec=LNGossip,
+            logger=mock.Mock(),
+            channel_db=mock.Mock(
+                get_channel_ids=lambda: set(known),
+                remove_channels_absent_from_peers=removed.extend,
+                has_policy_newer_than=has_policy_newer_than,
+                get_latest_policy_timestamp=lambda: latest_policy_ts,
+                latest_policy_ts_at_load=latest_policy_ts,
+            ),
+            network=mock.Mock(get_local_height=lambda: local_height),
+            CHANNEL_RANGE_NUM_PEERS=LNGossip.CHANNEL_RANGE_NUM_PEERS,
+            CHANNEL_RANGE_MIN_PEER_COVERAGE=LNGossip.CHANNEL_RANGE_MIN_PEER_COVERAGE,
+            CHANNEL_RANGE_MAX_REMOVED_FRACTION=LNGossip.CHANNEL_RANGE_MAX_REMOVED_FRACTION,
+            CHANNEL_RANGE_MIN_CHANNEL_AGE=LNGossip.CHANNEL_RANGE_MIN_CHANNEL_AGE,
+            CHANNEL_RANGE_RECENT_POLICY_AGE=LNGossip.CHANNEL_RANGE_RECENT_POLICY_AGE,
+            CHANNEL_RANGE_FRESH_DB_AGE=LNGossip.CHANNEL_RANGE_FRESH_DB_AGE,
+            _channel_range_counts=None,
+            _channel_range_recent_ts=0,
+            _channel_range_max_height=0,
+            _channel_range_db_is_fresh=False,
+            _channel_range_peers=set(),
+            _channel_range_done=False,
+        )
+        return g, removed
+
+    async def _report(self, g, peer_ids_and_lists):
+        for peer_id, ids in peer_ids_and_lists:
+            await LNGossip.on_channel_range_reply(g, peer_id, set(ids))
+
+    def test_constants(self):
+        # a change of these should be a conscious decision
+        self.assertEqual(4, LNGossip.CHANNEL_RANGE_NUM_PEERS)
+        self.assertEqual(0.9, LNGossip.CHANNEL_RANGE_MIN_PEER_COVERAGE)
+
+    async def test_only_channels_listed_by_a_minority_of_peers_get_removed(self):
+        scids = [self._scid(n) for n in range(40)]
+        three_of_four, two_of_four = scids[0], scids[1]
+        everyone = set(scids[2:])
+        g, removed = self._lngossip(scids)
+        await self._report(g, [
+            (b'a', everyone | {three_of_four, two_of_four}),
+            (b'b', everyone | {three_of_four, two_of_four}),
+            (b'c', everyone | {three_of_four}),
+            (b'd', everyone),
+        ])
+        self.assertEqual([two_of_four], removed)
+
+    async def test_nothing_is_removed_before_enough_distinct_peers_reported(self):
+        scids = [self._scid(n) for n in range(30)]
+        g, removed = self._lngossip(scids)
+        same_peer_many_times = [(b'a', scids[1:])] * 10
+        await self._report(g, same_peer_many_times + [(bytes([i]), scids[1:]) for i in range(1, self.NUM_PEERS - 1)])
+        self.assertEqual([], removed)
+
+    async def test_peers_with_an_incomplete_view_do_not_vote(self):
+        scids = [self._scid(n) for n in range(30)]
+        g, removed = self._lngossip(scids)
+        tiny_peers = [(bytes([100 + i]), scids[1:5]) for i in range(5)]
+        full_peers = [(bytes([i]), scids) for i in range(self.NUM_PEERS)]
+        await self._report(g, tiny_peers)
+        self.assertEqual(set(), g._channel_range_peers)
+        await self._report(g, full_peers)
+        self.assertEqual([], removed)
+
+    async def test_decision_is_made_once_and_further_peers_do_not_change_it(self):
+        scids = [self._scid(n) for n in range(30)]
+        g, removed = self._lngossip(scids)
+        await self._report(g, [(bytes([i]), scids[1:]) for i in range(self.NUM_PEERS)])
+        self.assertEqual([scids[0]], removed)
+        self.assertTrue(g._channel_range_done)
+        await self._report(g, [(b'x', scids[2:]), (b'y', scids[2:]), (b'z', scids[2:])])
+        self.assertEqual([scids[0]], removed)
+
+    async def test_young_channels_are_not_removed(self):
+        height_limit = 1000 - LNGossip.CHANNEL_RANGE_MIN_CHANNEL_AGE
+        young = self._scid(1, height=height_limit + 1)
+        old_enough = self._scid(2, height=height_limit)
+        others = [self._scid(n) for n in range(10, 40)]
+        g, removed = self._lngossip(others + [young, old_enough])
+        await self._report(g, [(bytes([i]), others) for i in range(self.NUM_PEERS)])
+        self.assertEqual([old_enough], removed)
+
+    async def test_height_is_taken_when_the_first_peer_reports(self):
+        # the peers answered for the height we had at that time, even if we catch up later
+        height_limit = 1000 - LNGossip.CHANNEL_RANGE_MIN_CHANNEL_AGE
+        too_young_at_first_report = self._scid(1, height=height_limit + 1)
+        others = [self._scid(n) for n in range(10, 40)]
+        g, removed = self._lngossip(others + [too_young_at_first_report], local_height=1000)
+        await self._report(g, [(b'a', others)])
+        g.network.get_local_height = lambda: 5000
+        await self._report(g, [(bytes([i]), others) for i in range(1, self.NUM_PEERS)])
+        self.assertEqual([], removed)
+
+    async def test_recently_updated_channels_are_not_removed(self):
+        scids = [self._scid(n) for n in range(30)]
+        g, removed = self._lngossip(scids, recently_updated={scids[0]})
+        await self._report(g, [(bytes([i]), scids[2:]) for i in range(self.NUM_PEERS)])
+        self.assertEqual([scids[1]], removed)
+
+    async def test_channels_updated_shortly_before_our_newest_policy_are_not_removed(self):
+        # we were offline for 8 hours: what counts as recent is relative to our newest policy.
+        # A channel often gets updated shortly before it is closed, so this is a few hours only.
+        now = int(time.time())
+        latest = now - 8 * 3600
+        scids = [self._scid(n) for n in range(30)]
+        policy_timestamps = {scid: latest - 3600 for scid in scids}
+        policy_timestamps[scids[0]] = latest - LNGossip.CHANNEL_RANGE_RECENT_POLICY_AGE + 600
+        policy_timestamps[scids[1]] = latest - LNGossip.CHANNEL_RANGE_RECENT_POLICY_AGE - 600
+        g, removed = self._lngossip(scids, latest_policy_ts=latest, policy_timestamps=policy_timestamps)
+        await self._report(g, [(bytes([i]), scids[2:]) for i in range(self.NUM_PEERS)])
+        self.assertEqual([scids[1]], removed)
+        self.assertEqual(3 * 3600, LNGossip.CHANNEL_RANGE_RECENT_POLICY_AGE)
+        self.assertEqual(24 * 3600, LNGossip.CHANNEL_RANGE_FRESH_DB_AGE)
+
+    async def test_updates_of_this_session_do_not_move_what_counts_as_recent(self):
+        # e.g. the channel_update of a payment that failed before the first reply of a peer
+        now = int(time.time())
+        last_online = now - 8 * 3600
+        scids = [self._scid(n) for n in range(30)]
+        policy_timestamps = {scid: last_online - 3600 for scid in scids}
+        policy_timestamps[scids[0]] = last_online - 2 * 3600
+        g, removed = self._lngossip(scids, latest_policy_ts=last_online, policy_timestamps=policy_timestamps)
+        policy_timestamps[scids[5]] = now - 60
+        g.channel_db.get_latest_policy_timestamp = lambda: now
+        await self._report(g, [(bytes([i]), scids[1:]) for i in range(self.NUM_PEERS)])
+        self.assertEqual([], removed)
+
+    async def test_nothing_is_removed_if_our_db_is_outdated(self):
+        # after downtime every policy is old, so recent updates cannot protect live channels
+        scids = [self._scid(n) for n in range(30)]
+        latest = int(time.time()) - LNGossip.CHANNEL_RANGE_FRESH_DB_AGE - 3600
+        g, removed = self._lngossip(scids, latest_policy_ts=latest)
+        await self._report(g, [(bytes([i]), scids[1:]) for i in range(self.NUM_PEERS)])
+        self.assertEqual([], removed)
+        self.assertTrue(g._channel_range_done)
+
+    async def test_nothing_is_removed_if_too_many_channels_would_go(self):
+        scids = [self._scid(n) for n in range(40)]
+        g, removed = self._lngossip(scids)
+        without_first_four = scids[4:]
+        without_next_four = scids[:4] + scids[8:]
+        await self._report(g, [(b'a', without_first_four), (b'b', without_first_four),
+                               (b'c', without_next_four), (b'd', without_next_four)])
+        self.assertEqual([], removed)
+        self.assertTrue(g._channel_range_done)  # and we do not try again with further peers
+
+    async def test_channels_learned_after_the_first_report_are_not_judged(self):
+        scids = [self._scid(n) for n in range(30)]
+        learned_later = self._scid(99)
+        known = list(scids)
+        g, removed = self._lngossip([])
+        g.channel_db.get_channel_ids = lambda: set(known)
+        await self._report(g, [(b'a', scids)])
+        known.append(learned_later)
+        await self._report(g, [(bytes([i]), scids) for i in range(1, self.NUM_PEERS)])
+        self.assertEqual([], removed)
 
 
 class Test_LNRouter(ElectrumTestCase):
@@ -88,6 +1933,7 @@ class Test_LNRouter(ElectrumTestCase):
             register_callback = lambda *args: None
             interface = None
 
+        self.fake_network = fake_network
         fake_network.channel_db = lnrouter.ChannelDB(fake_network())
         fake_network.channel_db.data_loaded.set()
         self.cdb = fake_network.channel_db
@@ -197,6 +2043,676 @@ class Test_LNRouter(ElectrumTestCase):
         add_chan_upd({'short_channel_id': channel(6), 'message_flags': b'\x00', 'channel_flags': b'\x01', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 0})
         add_chan_upd({'short_channel_id': channel(7), 'message_flags': b'\x00', 'channel_flags': b'\x00', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 0})
         add_chan_upd({'short_channel_id': channel(7), 'message_flags': b'\x00', 'channel_flags': b'\x01', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 0})
+
+    async def test_orphaned_channels_are_remembered(self):
+        self.prepare_graph()
+        scid = channel(100)
+        self.cdb.add_channel_announcements({
+            'node_id_1': node('a'), 'node_id_2': node('e'),
+            'bitcoin_key_1': node('a'), 'bitcoin_key_2': node('e'),
+            'short_channel_id': scid,
+            'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+            'len': 0, 'features': b''
+        }, trusted=True)
+        self.assertIn(scid, self.cdb.get_channel_ids())
+        self.assertEqual(set(), self.cdb.get_recently_orphaned_channel_ids())
+        self.cdb.prune_orphaned_channels()  # we were told about this channel, but got no recent policy
+        self.assertNotIn(scid, self.cdb.get_channel_ids())
+        self.assertEqual({scid}, self.cdb.get_recently_orphaned_channel_ids())
+        # the record is persisted, so that it survives a restart
+        read_table = sql(lambda db: list(db.conn.cursor().execute("SELECT short_channel_id FROM orphaned_channel")))
+        self.assertEqual([(bytes(scid),)], await read_table(self.cdb))
+        # after a restart it is loaded from the db again
+        self.cdb.stop()
+        await self.cdb.stopped_event.wait()
+        self.cdb = lnrouter.ChannelDB(self.fake_network())
+        await self.cdb.load_data()
+        self.assertEqual({scid}, self.cdb.get_recently_orphaned_channel_ids())
+        # and it expires, also from the db
+        with mock.patch('time.time', return_value=time.time() + self.cdb.ORPHANED_CHANNEL_REQUERY_DELAY + 1):
+            self.assertEqual(set(), self.cdb.get_recently_orphaned_channel_ids())
+            self.cdb._remember_orphaned_channels({channel(101)})
+        self.assertEqual([channel(101)], list(self.cdb._orphaned_channels))
+        self.assertEqual([(bytes(channel(101)),)], await read_table(self.cdb))
+
+    async def test_recently_orphaned_among_tells_only_those_pruned_recently(self):
+        self.prepare_graph()
+        self.cdb._remember_orphaned_channels({channel(100)})
+        with self.cdb.lock:
+            self.cdb._orphaned_channels[channel(101)] = int(time.time()) - self.cdb.ORPHANED_CHANNEL_REQUERY_DELAY - 10
+        self.assertEqual({bytes(channel(100))}, self.cdb.get_recently_orphaned_among(
+            [bytes(channel(100)), bytes(channel(101)), bytes(channel(102))]))
+        self.assertEqual([True, False, False], [
+            self.cdb.is_recently_orphaned(bytes(channel(n))) for n in (100, 101, 102)])
+
+    async def test_avoided_peer_is_not_taken_from_the_recent_peers_nor_at_random(self):
+        self.prepare_graph()
+        a, b = LNPeerAddr('203.0.113.1', 9735, node('a')), LNPeerAddr('203.0.113.2', 9735, node('b'))
+        with mock.patch('time.time', return_value=time.time() - 60):
+            self.cdb.add_recent_peer(LNPeerAddr('203.0.113.9', 9735, node('a')))  # an older address of it
+        self.cdb.add_recent_peer(a)
+        self.cdb.add_recent_peer(b)
+        self.assertEqual([b, a], self.cdb.get_recent_peers())
+        self.assertIn(node('a'), self.cdb.get_200_randomly_sorted_nodes_not_in(set()))
+        self.cdb.avoid_peer(node('a'))
+        self.assertEqual([b], self.cdb.get_recent_peers())
+        random_nodes = self.cdb.get_200_randomly_sorted_nodes_not_in(set())
+        self.assertNotIn(node('a'), random_nodes)
+        self.assertIn(node('b'), random_nodes)
+        # what we know of it stays: a wallet that has a channel with it connects to its last good address
+        self.assertEqual(a, self.cdb.get_last_good_address(node('a')))
+        self.cdb.add_recent_peer(a)  # (as when that wallet connects to it)
+        self.assertEqual([b], self.cdb.get_recent_peers())
+        # also after a restart
+        read_meta = sql(lambda db: dict(db.conn.cursor().execute("SELECT key, value FROM meta")))
+        meta = await read_meta(self.cdb)  # (the db drops the writes that are still queued when it stops)
+        self.assertEqual(['avoided_peer:' + node('a').hex()], list(meta))
+        self.cdb.stop()
+        await self.cdb.stopped_event.wait()
+        self.cdb = lnrouter.ChannelDB(self.fake_network())
+        await self.cdb.load_data()
+        self.assertEqual([b], self.cdb.get_recent_peers())
+        self.assertEqual(a, self.cdb.get_last_good_address(node('a')))
+        # until the time is up; and then the record is dropped when another node is avoided
+        with mock.patch('time.time', return_value=time.time() + self.cdb.AVOIDED_PEER_PERIOD + 1):
+            self.assertFalse(self.cdb.is_avoided_peer(node('a')))
+            self.cdb.add_recent_peer(a)
+            self.assertEqual([a, b], self.cdb.get_recent_peers())
+            self.cdb.avoid_peer(node('b'))
+            self.assertEqual(['avoided_peer:' + node('b').hex()], list(await read_meta(self.cdb)))
+
+    async def test_orphaned_channel_that_turns_out_alive_is_forgotten(self):
+        self.prepare_graph()
+        self.cdb._remember_orphaned_channels({channel(100), channel(101)})
+        self.cdb.forget_orphaned_channels([bytes(channel(100)), channel(102)])
+        self.assertEqual({channel(101)}, self.cdb.get_recently_orphaned_channel_ids())
+        read_table = sql(lambda db: list(db.conn.cursor().execute("SELECT short_channel_id FROM orphaned_channel")))
+        self.assertEqual([(bytes(channel(101)),)], await read_table(self.cdb))
+
+    async def test_channel_counts_tell_the_usable_channels(self):
+        self.prepare_graph()
+        seen = []
+        with mock.patch.object(util, 'trigger_callback', lambda event, *args: seen.append((event, args))):
+            for scid in (channel(100), channel(101)):
+                self.cdb.add_channel_announcements({
+                    'node_id_1': node('a'), 'node_id_2': node('e'),
+                    'bitcoin_key_1': node('a'), 'bitcoin_key_2': node('e'),
+                    'short_channel_id': scid,
+                    'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+                    'len': 0, 'features': b''
+                }, trusted=True)
+            # one policy of the second one: it can be used in one direction
+            self.cdb.add_channel_update(
+                {'short_channel_id': channel(101), 'message_flags': b'\x00', 'channel_flags': b'\x00',
+                 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100,
+                 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+                 'timestamp': int(time.time())}, verify=False)
+            self.cdb.update_counts()
+        num_nodes, num_channels, num_policies, num_usable = [args for event, args in seen if event == 'channel_db'][-1]
+        self.assertEqual(self.cdb.num_channels, num_channels)
+        self.assertEqual(num_channels - 1, num_usable)  # all but the one without a policy
+        self.assertEqual(num_usable, self.cdb.num_usable_channels)
+
+    async def test_prune_old_policies_tolerates_policies_removed_concurrently(self):
+        self.prepare_graph()
+        stale_key = (node('b'), channel(1))
+        self.assertIn(stale_key, self.cdb._policies)
+        keys = self.cdb.get_old_policies(3600)
+        self.cdb.remove_channels_absent_from_peers({channel(1)})
+        self.assertNotIn(stale_key, self.cdb._policies)
+        with mock.patch.object(self.cdb, 'get_old_policies', return_value=keys):
+            self.cdb.prune_old_policies(3600)
+        self.assertEqual(0, self.cdb.num_policies)
+
+    async def test_channel_that_got_a_policy_is_not_remembered_as_orphaned_later(self):
+        self.prepare_graph()
+        scid = channel(100)
+        self.cdb.add_channel_announcements({
+            'node_id_1': node('a'), 'node_id_2': node('e'),
+            'bitcoin_key_1': node('a'), 'bitcoin_key_2': node('e'),
+            'short_channel_id': scid,
+            'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+            'len': 0, 'features': b''
+        }, trusted=True)
+        update = {'short_channel_id': scid, 'message_flags': b'\x00', 'channel_flags': b'\x00', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 1000}
+        self.cdb.add_channel_update(update, verify=False)
+        self.cdb.prune_orphaned_channels()  # has a policy: not orphaned, and the marks are reset
+        self.assertIn(scid, self.cdb.get_channel_ids())
+        self.cdb.prune_old_policies(3600)  # later, the policy ages out
+        self.cdb.prune_orphaned_channels()
+        self.assertNotIn(scid, self.cdb.get_channel_ids())
+        self.assertEqual(set(), self.cdb.get_recently_orphaned_channel_ids())
+
+    async def test_channels_not_announced_since_the_last_prune_are_not_remembered_as_orphaned(self):
+        # a channel left in the db without policies by an earlier session (e.g. which got killed
+        # between processing the announcement and the updates) should get queried again
+        self.prepare_graph()
+        scid = channel(100)
+        self.cdb.add_channel_announcements({
+            'node_id_1': node('a'), 'node_id_2': node('e'),
+            'bitcoin_key_1': node('a'), 'bitcoin_key_2': node('e'),
+            'short_channel_id': scid,
+            'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+            'len': 0, 'features': b''
+        }, trusted=True)
+        self.cdb._chans_announced_since_last_prune.clear()  # as after a restart
+        self.cdb.prune_orphaned_channels()
+        self.assertNotIn(scid, self.cdb.get_channel_ids())
+        self.assertEqual(set(), self.cdb.get_recently_orphaned_channel_ids())
+
+    async def test_channels_with_aged_out_policies_are_not_remembered_as_orphaned(self):
+        # after being offline for longer than max_age all policies age out. these channels
+        # are probably still alive, so they must get queried again.
+        self.prepare_graph()
+        self.assertGreater(self.cdb.num_channels, 0)
+        self.cdb.prune_orphaned_channels()  # periodic maintenance: nothing to do yet
+        self.cdb.prune_old_policies(3600)  # note: all policies in the test graph have timestamp=0
+        self.assertEqual(0, self.cdb.num_policies)
+        self.cdb.prune_orphaned_channels()
+        self.assertEqual(0, self.cdb.num_channels)
+        self.assertEqual(set(), self.cdb.get_recently_orphaned_channel_ids())
+
+    async def test_remove_channels_absent_from_peers(self):
+        self.prepare_graph()
+        num_channels = self.cdb.num_channels
+        self.assertIsNotNone(self.cdb.get_policy_for_node(channel(1), node('b')))
+        self.cdb.remove_channels_absent_from_peers({channel(1)})
+        self.assertEqual(num_channels - 1, self.cdb.num_channels)
+        self.assertNotIn(channel(1), self.cdb.get_channel_ids())
+        self.assertNotIn((node('b'), channel(1)), self.cdb._policies)
+        self.assertNotIn((node('c'), channel(1)), self.cdb._policies)
+        self.assertEqual({channel(1)}, self.cdb.get_recently_orphaned_channel_ids())
+
+    async def test_has_policy_newer_than(self):
+        self.prepare_graph()
+        self.assertFalse(self.cdb.has_policy_newer_than(channel(1), 500))
+        self.cdb.add_channel_update({'short_channel_id': channel(1), 'message_flags': b'\x00', 'channel_flags': b'\x01', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 1000}, verify=False)
+        self.assertTrue(self.cdb.has_policy_newer_than(channel(1), 500))
+        self.assertFalse(self.cdb.has_policy_newer_than(channel(1), 1000))
+        self.assertFalse(self.cdb.has_policy_newer_than(channel(999), 0))
+
+    async def test_latest_policy_timestamp_at_load(self):
+        class fake_network:
+            config = self.config
+            asyncio_loop = util.get_asyncio_loop()
+            trigger_callback = lambda *args: None
+            register_callback = lambda *args: None
+            interface = None
+        def add_channel(cdb, number, timestamp):
+            n1, n2 = sorted([node('a'), node('b')])
+            cdb.add_channel_announcements({
+                'node_id_1': n1, 'node_id_2': n2, 'bitcoin_key_1': n1, 'bitcoin_key_2': n2,
+                'short_channel_id': channel(number), 'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+                'len': 0, 'features': b''}, trusted=True)
+            update = {
+                'short_channel_id': channel(number), 'message_flags': b'\x00', 'channel_flags': b'\x00',
+                'cltv_expiry_delta': 40, 'htlc_minimum_msat': 1, 'fee_base_msat': 0,
+                'fee_proportional_millionths': 0, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+                'timestamp': timestamp}
+            update['raw'] = encode_msg('channel_update', signature=bytes(64), **update)  # saved to disk
+            cdb.add_channel_update(update, verify=False)
+        cdb = lnrouter.ChannelDB(fake_network())
+        cdb.data_loaded.set()
+        add_channel(cdb, 1, 1_700_000_000)
+        add_channel(cdb, 2, 1_700_001_000)
+        await cdb.load_data()  # returns at once, as loaded; the writes queued before it are done then
+        cdb.stop()
+        await cdb.stopped_event.wait()
+        self.cdb = lnrouter.ChannelDB(fake_network())
+        self.assertIsNone(self.cdb.latest_policy_ts_at_load)
+        await self.cdb.load_data()
+        self.assertEqual(1_700_001_000, self.cdb.latest_policy_ts_at_load)
+        add_channel(self.cdb, 3, 1_700_002_000)
+        self.assertEqual(1_700_002_000, self.cdb.get_latest_policy_timestamp())
+        self.assertEqual(1_700_001_000, self.cdb.latest_policy_ts_at_load)
+
+    async def test_synced_until_is_saved_and_loaded(self):
+        class fake_network:
+            config = self.config
+            asyncio_loop = util.get_asyncio_loop()
+            trigger_callback = lambda *args: None
+            register_callback = lambda *args: None
+            interface = None
+        cdb = lnrouter.ChannelDB(fake_network())
+        self.assertIsNone(cdb.synced_until_at_load)
+        await cdb.load_data()
+        self.assertIsNone(cdb.synced_until_at_load)  # a db from before we recorded it
+        await cdb.save_synced_until(1_700_000_000)
+        await cdb.save_synced_until(1_700_000_500.9)
+        self.assertIsNone(cdb.synced_until_at_load)
+        # it is on disk already, in case we get killed: another connection sees it
+        other = sqlite3.connect(cdb.path)
+        self.assertEqual([(1_700_000_500,)], other.execute("SELECT value FROM meta WHERE key='synced_until'").fetchall())
+        other.close()
+        cdb.stop()
+        await cdb.stopped_event.wait()
+        self.cdb = lnrouter.ChannelDB(fake_network())
+        await self.cdb.load_data()
+        self.assertEqual(1_700_000_500, self.cdb.synced_until_at_load)
+
+    async def test_get_latest_policy_timestamp(self):
+        self.prepare_graph()
+        self.assertEqual(0, self.cdb.get_latest_policy_timestamp())
+        policies = self.cdb._policies
+        self.cdb._policies = {}
+        self.assertIsNone(self.cdb.get_latest_policy_timestamp())
+        self.cdb._policies = policies
+        self.cdb.add_channel_update({'short_channel_id': channel(1), 'message_flags': b'\x00', 'channel_flags': b'\x00', 'cltv_expiry_delta': 10, 'htlc_minimum_msat': 250, 'fee_base_msat': 100, 'fee_proportional_millionths': 150, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 1000}, verify=False)
+        self.assertEqual(1000, self.cdb.get_latest_policy_timestamp())
+
+    def _make_graph(self, chans):
+        """chans: (number, node_x, node_y, policy from x to y, policy from y to x),
+        a policy being (fee_base_msat, fee_proportional_millionths, cltv_delta)"""
+        class fake_network:
+            config = self.config
+            asyncio_loop = util.get_asyncio_loop()
+            trigger_callback = lambda *args: None
+            register_callback = lambda *args: None
+            interface = None
+        self.cdb = lnrouter.ChannelDB(fake_network())
+        self.cdb.data_loaded.set()
+        self.path_finder = lnrouter.LNPathFinder(self.cdb)
+        for number, x, y, policy_xy, policy_yx in chans:
+            n1, n2 = sorted([x, y])
+            self.cdb.add_channel_announcements({
+                'node_id_1': n1, 'node_id_2': n2, 'bitcoin_key_1': n1, 'bitcoin_key_2': n2,
+                'short_channel_id': channel(number), 'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+                'len': 0, 'features': b''}, trusted=True)
+            for start, (fee_base_msat, fee_proportional_millionths, cltv_delta) in ((x, policy_xy), (y, policy_yx)):
+                self.cdb.add_channel_update({
+                    'short_channel_id': channel(number), 'message_flags': b'\x00',
+                    'channel_flags': b'\x00' if start == n1 else b'\x01',
+                    'cltv_expiry_delta': cltv_delta, 'htlc_minimum_msat': 1, 'fee_base_msat': fee_base_msat,
+                    'fee_proportional_millionths': fee_proportional_millionths,
+                    'chain_hash': BitcoinTestnet.rev_genesis_bytes(), 'timestamp': 0}, verify=False)
+
+    async def test_find_path_with_penalty_weight_zero_lets_1_msat_of_fees_outweigh_the_other_costs(self):
+        # 100k sat: the other costs of a channel are about 15k msat, but only break ties
+        o, p, a, b, w = node('o'), node('p'), node('a'), node('b'), node('w')
+        free = (0, 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, w, (1000, 0, 40), free),
+            (33, p, a, free, free),
+            (34, a, b, free, free),
+            (35, b, w, (999, 0, 40), free),
+        ])
+        path = self.path_finder.find_path_for_payment(
+            nodeA=o, nodeB=w, invoice_amount_msat=100_000_000, penalty_weight=0)
+        self.assertEqual([channel(n) for n in (31, 33, 34, 35)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_with_penalty_weight_zero_breaks_ties_with_the_cltv_cost(self):
+        # same fees and channels; the path over a is found first, but has the longer cltv delta
+        o, p, a, b, w = node('o'), node('p'), node('a'), node('b'), node('w')
+        free = (0, 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, a, (500, 0, 40), free),
+            (33, a, w, (500, 0, 144), free),
+            (34, p, b, (500, 0, 40), free),
+            (35, b, w, (500, 0, 40), free),
+        ])
+        path = self.path_finder.find_path_for_payment(
+            nodeA=o, nodeB=w, invoice_amount_msat=1_000_000, penalty_weight=0)
+        self.assertEqual([channel(n) for n in (31, 34, 35)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_prefers_fewer_hops_over_small_fee_savings(self):
+        # every channel of a path is another chance to fail, so a path that is a bit more expensive
+        # but has fewer channels of unknown liquidity should be preferred
+        sender, short_mid, long_mid1, long_mid2, dest = node('p'), node('q'), node('r'), node('s'), node('w')
+        free = (0, 0, 10)
+        self._make_graph([
+            (31, sender, short_mid, free, free),
+            (32, short_mid, dest, (3000, 0, 10), free),  # one hop less, 3 sat more expensive
+            (33, sender, long_mid1, free, free),
+            (34, long_mid1, long_mid2, free, free),
+            (35, long_mid2, dest, free, free),
+        ])
+        path = self.path_finder.find_path_for_payment(nodeA=sender, nodeB=dest, invoice_amount_msat=13_000_000)
+        self.assertEqual([channel(31), channel(32)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_with_a_higher_penalty_weight_prefers_fewer_channels(self):
+        # 20k sat: the penalty is 7 sat per channel of unknown liquidity
+        o, p, a, b, w = node('o'), node('p'), node('a'), node('b'), node('w')
+        free = (0, 0, 10)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, w, (20_000, 0, 10), free),  # 20 sat, two channels less
+            (33, p, a, free, free),
+            (34, a, b, free, free),
+            (35, b, w, free, free),
+        ])
+        def find(penalty_weight):
+            path = self.path_finder.find_path_for_payment(
+                nodeA=o, nodeB=w, invoice_amount_msat=20_000_000, penalty_weight=penalty_weight)
+            return [edge.short_channel_id for edge in path]
+        self.assertEqual([channel(n) for n in (31, 33, 34, 35)], find(1))
+        self.assertEqual([channel(n) for n in (31, 32)], find(3))
+
+    async def test_find_path_hop_penalty_is_small_for_small_amounts(self):
+        # for a small payment, the cost of an extra hop must stay small compared to the fees
+        sender, p, q, a1, a2, a3, dest = node('o'), node('p'), node('q'), node('r'), node('s'), node('t'), node('w')
+        free = (0, 0, 10)
+        def fee(sat):
+            return (sat * 1000, 0, 10)
+        self._make_graph([
+            (31, sender, p, free, free),
+            (32, p, q, fee(10), free),  # short path: 11 sat
+            (33, q, dest, fee(1), free),
+            (34, p, a1, fee(1), free),  # long path: 4 sat
+            (35, a1, a2, fee(1), free),
+            (36, a2, a3, fee(1), free),
+            (37, a3, dest, fee(1), free),
+        ])
+        path = self.path_finder.find_path_for_payment(nodeA=sender, nodeB=dest, invoice_amount_msat=1_000_000)
+        self.assertEqual([channel(n) for n in (31, 34, 35, 36, 37)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_does_not_extend_paths_beyond_the_fee_budget(self):
+        # path finding does not use the fees alone: a path with fewer channels can cost more in fees.
+        # Paths over the fee budget are not extended, so that here the longer path within it is found.
+        o, p, q, a1, a2, w = node('o'), node('p'), node('q'), node('r'), node('s'), node('w')
+        free = (0, 0, 40)
+        def fee(sat):
+            return (int(sat * 1000), 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, q, fee(20.5), free),  # short path: 20.5 + 30 = 50.5 sat
+            (34, p, a1, fee(19.5), free),  # long path: 19.5 + 30 = 49.5 sat
+            (35, a1, a2, free, free),
+            (36, a2, q, free, free),
+            (37, q, w, fee(30), free),
+        ])
+        amount_msat = 5_000_000
+        def find(max_fee_msat):
+            path = self.path_finder.find_path_for_payment(
+                nodeA=o, nodeB=w, invoice_amount_msat=amount_msat, max_fee_msat=max_fee_msat)
+            return path and [edge.short_channel_id for edge in path]
+        self.assertEqual([channel(n) for n in (31, 32, 37)], find(None))
+        self.assertEqual([channel(n) for n in (31, 34, 35, 36, 37)], find(50_000))
+        self.assertEqual(None, find(49_000))
+
+    async def test_find_path_with_penalty_weight_zero(self):
+        # as path finding keeps one path per node, the search with penalties can miss a path within the
+        # budget: here, x is reached over the direct channel to w, and from p, that path exceeds a budget
+        # of 32 sat, while the one over y does not. The search by fees finds the cheapest path.
+        o, p, x, y, w = node('o'), node('p'), node('x'), node('y'), node('w')
+        free = (0, 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, x, (30_000, 0, 40), free),
+            (33, x, w, (3000, 0, 40), free),
+            (34, x, y, free, free),
+            (35, y, w, free, free),
+        ])
+        def find():
+            path = self.path_finder.find_path_for_payment(
+                nodeA=o, nodeB=w, invoice_amount_msat=5_000_000, penalty_weight=0)
+            return [edge.short_channel_id for edge in path]
+        self.assertEqual([channel(n) for n in (31, 32, 34, 35)], find())
+        # channels that cannot send the amount are still excluded
+        self.path_finder.liquidity_hints.update_cannot_send(x, y, channel(34), amount_msat=1_000_000)
+        self.assertEqual([channel(n) for n in (31, 32, 33)], find())
+
+    async def test_find_path_with_penalty_weight_zero_takes_the_lowest_fees(self):
+        o, p, a, b, c, w = node('o'), node('p'), node('a'), node('b'), node('c'), node('w')
+        free = (0, 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (32, p, w, (1000, 0, 40), free),  # 1 sat
+            (33, p, a, (100, 0, 40), free),  # 0.9 sat, over two more channels
+            (34, a, b, (800, 0, 40), free),
+            (35, b, w, free, free),
+        ])
+        def find():
+            path = self.path_finder.find_path_for_payment(
+                nodeA=o, nodeB=w, invoice_amount_msat=1_000_000, penalty_weight=0)
+            return [edge.short_channel_id for edge in path]
+        self.assertEqual([channel(n) for n in (31, 33, 34, 35)], find())
+
+    async def test_find_path_with_penalty_weight_zero_takes_fewer_channels_with_the_same_fees(self):
+        # both paths from p cost 0.9 sat. The longer one reaches p first in the search,
+        # the shorter one must still be taken.
+        o, p, a, b, c, w = node('o'), node('p'), node('a'), node('b'), node('c'), node('w')
+        free = (0, 0, 40)
+        self._make_graph([
+            (31, o, p, free, free),
+            (33, p, a, (450, 0, 40), free),
+            (34, a, b, (450, 0, 40), free),
+            (35, b, w, free, free),
+            (36, p, c, (100, 0, 40), free),
+            (37, c, w, (800, 0, 40), free),
+        ])
+        path = self.path_finder.find_path_for_payment(
+            nodeA=o, nodeB=w, invoice_amount_msat=1_000_000, penalty_weight=0)
+        self.assertEqual([channel(n) for n in (31, 36, 37)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_tries_other_paths_after_several_nodes_failed_to_forward_to_a_node(self):
+        # four nodes can forward to y for free, which can forward to w. After three of them failed
+        # to, the more expensive direct channel to w is tried before the fourth one.
+        s, h, y, w = node('s'), node('h'), node('y'), node('w')
+        xs = [node(c) for c in 'abcd']
+        free = (0, 0, 40)
+        chans = [(41, s, h, free, free), (42, y, w, free, free), (43, h, w, (10_000, 0, 40), free)]
+        for n, x in enumerate(xs):
+            chans += [(50 + n, h, x, free, free), (60 + n, x, y, free, free)]
+        self._make_graph(chans)
+        amount_msat = 1_000_000
+        failed = []
+        for _ in range(NODE_FAILURE_MIN_SENDERS):
+            path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=w, invoice_amount_msat=amount_msat)
+            self.assertEqual(y, path[2].end_node)
+            route = self.path_finder.create_route_from_path(path)
+            self.path_finder.update_liquidity_hints(route, amount_msat, failing_channel=path[2].short_channel_id)
+            failed.append(path[1].end_node)
+        self.assertEqual(NODE_FAILURE_MIN_SENDERS, len(set(failed)))
+        path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=w, invoice_amount_msat=amount_msat)
+        self.assertEqual([channel(41), channel(43)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_tries_parallel_channels_of_a_failed_node_pair_after_other_paths(self):
+        s, a, b, c, d = node('s'), node('a'), node('b'), node('c'), node('d')
+        free, expensive = (0, 0, 40), (10_000_000, 0, 40)
+        self._make_graph([
+            (41, s, a, free, free),
+            # parallel channels; only the direction b -> a is expensive (the one that does not count)
+            (42, a, b, free, expensive),
+            (43, a, b, free, expensive),
+            (44, b, d, free, free),
+            (45, a, c, (3000, 0, 40), free),  # the other path is 3 sat more expensive
+            (46, c, d, free, free),
+        ])
+        amount_msat = 1_000_000
+        path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+        self.assertEqual(b, path[1].end_node)
+        failing_channel = path[1].short_channel_id
+        route = self.path_finder.create_route_from_path(path)
+        self.path_finder.update_liquidity_hints(route, amount_msat, failing_channel=failing_channel)
+        path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+        self.assertEqual([channel(41), channel(45), channel(46)], [edge.short_channel_id for edge in path])
+        # without the other path, the parallel channel is still tried
+        self.path_finder.add_edge_to_blacklist(channel(45))
+        path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+        other_channel = ({channel(42), channel(43)} - {failing_channel}).pop()
+        self.assertEqual([channel(41), other_channel, channel(44)], [edge.short_channel_id for edge in path])
+
+    async def test_find_path_avoids_a_node_that_several_nodes_cannot_forward_to(self):
+        s, a, b, e, x, c, d = node('s'), node('a'), node('b'), node('e'), node('x'), node('c'), node('d')
+        free = (0, 0, 40)
+        self._make_graph([
+            (41, s, a, free, free),
+            (42, s, b, free, free),
+            (43, s, e, free, free),
+            (44, a, x, free, free),
+            (45, b, x, free, free),
+            (46, e, x, free, free),
+            (47, x, d, free, free),
+            (48, a, c, (3000, 0, 40), free),  # the path without x is 3 sat more expensive
+            (49, c, d, free, free),
+        ])
+        def find(**kwargs):
+            path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=1_000_000, **kwargs)
+            return [edge.end_node for edge in path]
+        def flag_x():
+            for reporter in (a, b, e):
+                self.path_finder.report_unknown_next_peer(reporter, x)
+        self.assertIn(x, find())
+        # the same node twice counts once, and expired reports do not count
+        self.path_finder.report_unknown_next_peer(a, x)
+        self.path_finder.report_unknown_next_peer(a, x)
+        self.path_finder.report_unknown_next_peer(b, x)
+        self.path_finder.report_unknown_next_peer(e, x, now=int(time.time()) - OFFLINE_NODE_DURATION - 1)
+        self.assertIn(x, find())
+        self.path_finder.report_unknown_next_peer(e, x)
+        self.assertEqual([a, c, d], find())
+        self.assertEqual([a, c, d], find(penalty_weight=0.25))
+        # until it forwards an htlc, or returns an error
+        route = self.path_finder.create_route_from_path([
+            PathEdge(start_node=s, end_node=a, short_channel_id=channel(41)),
+            PathEdge(start_node=a, end_node=x, short_channel_id=channel(44)),
+            PathEdge(start_node=x, end_node=d, short_channel_id=channel(47))])
+        self.path_finder.update_liquidity_hints(route, 2_000_000, failing_channel=channel(44))  # failed before x
+        self.assertEqual([a, c, d], find())
+        self.path_finder.update_liquidity_hints(route, 2_000_000, failing_channel=channel(47))  # x returned the error
+        self.assertIn(x, find())
+        flag_x()
+        self.path_finder.update_liquidity_hints(route, 1_000)  # success
+        self.assertIn(x, find())
+        flag_x()
+        self.assertEqual([a, c, d], find())
+        # until the reports expire
+        later = int(time.time()) + OFFLINE_NODE_DURATION + 1
+        with mock.patch('time.time', return_value=later):
+            self.assertIn(x, find())
+        # it is still used if there is no other path: unknown_next_peer is also the error for a closed channel
+        self.path_finder.add_edge_to_blacklist(channel(48))
+        self.assertIn(x, find())
+        self.path_finder.clear_blacklist()
+        self.assertIn(x, find())
+
+    async def test_find_path_with_the_lowest_fees_through_a_node_that_several_nodes_cannot_forward_to(self):
+        # the search for the lowest fees, the last resort of the fee budget, ignores it
+        s, m, n, x, y, d = node('s'), node('m'), node('n'), node('x'), node('y'), node('d')
+        free, two_sat = (0, 0, 40), (2000, 0, 40)
+        self._make_graph([
+            (41, s, m, free, free),
+            (42, m, n, two_sat, free),
+            (43, n, x, free, free),
+            (44, x, d, free, free),
+            (45, n, y, free, free),
+            (46, y, d, two_sat, free),
+        ])
+        for reporter in (node('a'), node('b'), node('c')):
+            self.path_finder.report_unknown_next_peer(reporter, x)
+        def find(**kwargs):
+            path = self.path_finder.find_path_for_payment(
+                nodeA=s, nodeB=d, invoice_amount_msat=1_000_000, max_fee_msat=3000, **kwargs)
+            return path and [edge.end_node for edge in path]
+        search_info = {}
+        self.assertIsNone(find(search_info=search_info))  # the path without x exceeds the budget
+        self.assertTrue(search_info['budget_pruned'])
+        self.assertEqual([m, n, x, d], find(penalty_weight=0))
+
+    async def test_find_path_uses_the_parallel_route_hint_channel_of_a_failed_node_pair(self):
+        # e.g. a receiver with two channels to a node that forwards only over the requested channel
+        s, a, x, d = node('s'), node('a'), node('x'), node('d')
+        self._make_graph([(41, s, a, (0, 0, 40), (0, 0, 40)), (47, a, x, (0, 0, 40), (0, 0, 40))])
+        hints = {scid: RouteEdge(start_node=x, end_node=d, short_channel_id=scid, fee_base_msat=1000,
+                                 fee_proportional_millionths=100, cltv_delta=40, node_features=0)
+                 for scid in (ShortChannelID.from_components(0, 0, 51), ShortChannelID.from_components(0, 0, 52))}
+        amount_msat = 1_000_000
+        path = self.path_finder.find_path_for_payment(
+            nodeA=s, nodeB=d, invoice_amount_msat=amount_msat, private_route_edges=hints)
+        failing_channel = path[-1].short_channel_id
+        route = self.path_finder.create_route_from_path(path, private_route_edges=hints)
+        self.path_finder.update_liquidity_hints(route, amount_msat, failing_channel=failing_channel)
+        path = self.path_finder.find_path_for_payment(
+            nodeA=s, nodeB=d, invoice_amount_msat=amount_msat, private_route_edges=hints)
+        self.assertIsNotNone(path)
+        self.assertEqual((set(hints) - {failing_channel}).pop(), path[-1].short_channel_id)
+
+    def test_liquidity_hints_of_a_node_pair_from_routes(self):
+        # the policies of the channels of a route are those used for the hints of the node pairs
+        self._make_graph([])
+        hints = self.path_finder.liquidity_hints
+        s, a, b = node('s'), node('a'), node('b')
+        amount_msat = 1_000_000
+        policy, more_expensive = (0, 100, 40), (2000, 100, 40)
+        def route_over(scid, policy):
+            fee_base_msat, fee_proportional_millionths, cltv_delta = policy
+            return [RouteEdge(start_node=s, end_node=a, short_channel_id=channel(41), fee_base_msat=0,
+                              fee_proportional_millionths=0, cltv_delta=40, node_features=0),
+                    RouteEdge(start_node=a, end_node=b, short_channel_id=channel(scid), fee_base_msat=fee_base_msat,
+                              fee_proportional_millionths=fee_proportional_millionths, cltv_delta=cltv_delta,
+                              node_features=0)]
+        default = LiquidityHintMgr().penalty(a, b, channel(49), amount_msat=amount_msat, policy=policy)
+        self.path_finder.update_liquidity_hints(route_over(42, policy), amount_msat, failing_channel=channel(42))
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default,
+                         hints.penalty(a, b, channel(49), amount_msat=amount_msat, policy=policy))
+        # a success over a more expensive channel does not contradict it
+        self.path_finder.update_liquidity_hints(route_over(48, more_expensive), amount_msat)
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default,
+                         hints.penalty(a, b, channel(49), amount_msat=amount_msat, policy=policy))
+        self.path_finder.update_liquidity_hints(route_over(43, policy), amount_msat)
+        self.assertEqual(default, hints.penalty(a, b, channel(49), amount_msat=amount_msat, policy=policy))
+
+    async def test_find_path_with_route_hints_sharing_an_scid_alias(self):
+        # hints from b and from d to x, with the same scid alias: each has a local short_channel_id,
+        # and its own blacklist entry, liquidity hints and cached channel updates
+        self.prepare_graph()
+        x = node('x')
+        alias = ShortChannelID.from_components(0, 1234567, 8901)
+        local_b = lnrouter.local_scid_for_route_hint(alias, node('b'), x, taken={alias})
+        local_d = lnrouter.local_scid_for_route_hint(alias, node('d'), x, taken={alias, local_b})
+        self.assertEqual(0xFFFFFF, local_d.block_height)
+        def hint(start, scid):
+            return RouteEdge(start_node=start, end_node=x, short_channel_id=scid, onion_short_channel_id=alias,
+                             fee_base_msat=1000, fee_proportional_millionths=100, cltv_delta=40, node_features=0)
+        private_route_edges = {local_b: hint(node('b'), local_b), local_d: hint(node('d'), local_d)}
+        def find():
+            route = self.path_finder.find_route(
+                nodeA=node('a'), nodeB=x, invoice_amount_msat=100_000, private_route_edges=private_route_edges)
+            return route and route[-1].start_node
+        self.path_finder.add_edge_to_blacklist(local_b)
+        self.assertEqual(node('d'), find())
+        self.path_finder.clear_blacklist()
+        self.path_finder.add_edge_to_blacklist(local_d)
+        self.assertEqual(node('b'), find())
+        self.path_finder.clear_blacklist()
+        # a failure to forward over one hint
+        for failing_start, other_start in ((node('b'), node('d')), (node('d'), node('b'))):
+            self.path_finder.liquidity_hints.reset_liquidity_hints()
+            failing = private_route_edges[local_b if failing_start == node('b') else local_d]
+            route = self.path_finder.create_route_from_path(
+                [PathEdge(start_node=node('a'), end_node=failing_start,
+                          short_channel_id=channel(3) if failing_start == node('b') else channel(6)),
+                 PathEdge(start_node=failing_start, end_node=x, short_channel_id=failing.short_channel_id)],
+                private_route_edges=private_route_edges)
+            self.path_finder.update_liquidity_hints(route, 100_000, failing_channel=failing.short_channel_id)
+            self.assertEqual(other_start, find())
+        self.path_finder.liquidity_hints.reset_liquidity_hints()
+        # a channel_update of the alias from d, e.g. from a failed htlc, applies to the hint from d
+        disabled_update = {
+            'short_channel_id': alias, 'message_flags': b'\x00', 'channel_flags': b'\x03',
+            'cltv_expiry_delta': 40, 'htlc_minimum_msat': 1, 'fee_base_msat': 1000,
+            'fee_proportional_millionths': 100, 'chain_hash': BitcoinTestnet.rev_genesis_bytes(),
+            'timestamp': util.now()}
+        with mock.patch('electrum.channel_db.verify_sig_for_channel_update', return_value=True):
+            self.assertTrue(self.cdb.add_channel_update_for_private_channel(disabled_update, node('d')))
+        self.path_finder.add_edge_to_blacklist(local_b)
+        self.assertIsNone(self.path_finder.find_route(
+            nodeA=node('a'), nodeB=x, invoice_amount_msat=100_000, private_route_edges=private_route_edges))
+
+    def test_local_scid_for_route_hint_is_not_taken(self):
+        alias = ShortChannelID.from_components(0, 1234567, 8901)
+        first = lnrouter.local_scid_for_route_hint(alias, node('d'), node('x'), taken=set())
+        self.assertEqual(first, lnrouter.local_scid_for_route_hint(alias, node('d'), node('x'), taken=set()))
+        second = lnrouter.local_scid_for_route_hint(alias, node('d'), node('x'), taken={first})
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(first, lnrouter.local_scid_for_route_hint(alias, node('b'), node('x'), taken=set()))
+        # however many are taken
+        taken = set()
+        for _ in range(100):
+            taken.add(lnrouter.local_scid_for_route_hint(alias, node('d'), node('x'), taken=taken))
+        self.assertEqual(100, len(taken))
 
     async def test_find_path_for_payment(self):
         self.prepare_graph()
@@ -340,7 +2856,7 @@ class Test_LNRouter(ElectrumTestCase):
 
         # check default penalty
         self.assertEqual(
-            fee_for_edge_msat(amount_to_send, DEFAULT_PENALTY_BASE_MSAT, DEFAULT_PENALTY_PROPORTIONAL_MILLIONTH),
+            1000 + 100,  # 0.1% of the amount + 100 ppm
             liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=amount_to_send)
         )
         liquidity_hints.update_can_send(node_from, node_to, channel_id, amount_msat=1_000_000)
@@ -354,7 +2870,7 @@ class Test_LNRouter(ElectrumTestCase):
 
         # check penalties
         self.assertEqual(0., liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=1_000_000))
-        self.assertEqual(650, liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=1_500_000))
+        self.assertEqual(1650, liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=1_500_000))  # 0.1% of the amount + 100 ppm
         self.assertEqual(inf, liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=2_000_000))
 
         # test that we don't overwrite significant info with less significant info
@@ -372,8 +2888,343 @@ class Test_LNRouter(ElectrumTestCase):
         liquidity_hints.reset_liquidity_hints()
         liquidity_hints.add_htlc(node_from, node_to, channel_id)
         liquidity_hints.get_hint(channel_id)
-        # we have got 600 (attempt) + 600 (inflight) penalty
-        self.assertEqual(1200, liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=1_000_000))
+        # we have got 1100 (attempt) + 1100 (inflight) penalty
+        self.assertEqual(2200, liquidity_hints.penalty(node_from, node_to, channel_id, amount_msat=1_000_000))
+
+    def test_liquidity_hints_of_a_node_pair(self):
+        # nodes usually forward over any of their channels to the next node whose policy the htlc
+        # satisfies (non-strict forwarding), so a failure to forward from A to B tells us something
+        # about the parallel channels between them that are not more expensive
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        chan_1, chan_2, chan_3 = channel(1), channel(2), channel(3)
+        policy = (1000, 100, 40)  # fee_base_msat, fee_proportional_millionths, cltv_delta
+        cheaper, more_expensive, longer_cltv = (0, 100, 40), (1000, 200, 40), (1000, 100, 41)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, chan_2, amount_msat=amount_msat, policy=policy)
+        def pair_failed(amount_msat):
+            return (1 + PAIR_FAILURE_PENALTY_FACTOR) * default(amount_msat)
+        hints.update_cannot_send(a, b, chan_1, amount_msat=1_000_000, policy=policy)
+        self.assertEqual(inf, hints.penalty(a, b, chan_1, amount_msat=1_000_000, policy=policy))
+        self.assertEqual(pair_failed(1_000_000), hints.penalty(a, b, chan_2, amount_msat=1_000_000, policy=policy))
+        self.assertEqual(pair_failed(2_000_000), hints.penalty(a, b, chan_2, amount_msat=2_000_000, policy=cheaper))
+        self.assertEqual(default(999_999), hints.penalty(a, b, chan_2, amount_msat=999_999, policy=policy))
+        self.assertEqual(default(1_000_000), hints.penalty(a, b, chan_2, amount_msat=1_000_000, policy=more_expensive))
+        self.assertEqual(default(1_000_000), hints.penalty(a, b, chan_2, amount_msat=1_000_000, policy=longer_cltv))
+        self.assertEqual(default(1_000_000), hints.penalty(b, a, chan_2, amount_msat=1_000_000, policy=policy))  # other direction
+        # more failures, of smaller amounts
+        hints.update_cannot_send(a, b, chan_2, amount_msat=500_000, policy=policy)
+        hints.update_cannot_send(a, b, chan_1, amount_msat=800_000, policy=policy)
+        self.assertEqual(pair_failed(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        # a successful forward contradicts the failure, if it was of at least the failed amount,
+        # over a channel not more expensive than the failed one
+        hints.update_can_send(a, b, chan_1, amount_msat=400_000, policy=policy)
+        self.assertEqual(pair_failed(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        hints.update_can_send(a, b, chan_1, amount_msat=600_000, policy=more_expensive)
+        self.assertEqual(pair_failed(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        hints.update_can_send(a, b, chan_1, amount_msat=600_000, policy=policy)
+        self.assertEqual(default(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        # a failure without the policy of the channel does not say which parallel channels it applies to
+        hints.update_cannot_send(a, b, chan_1, amount_msat=100_000)
+        self.assertEqual(default(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        # reset
+        hints.update_cannot_send(a, b, chan_1, amount_msat=100_000, policy=policy)
+        self.assertEqual(pair_failed(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+        hints.reset_liquidity_hints()
+        self.assertEqual(default(600_000), hints.penalty(a, b, chan_3, amount_msat=600_000, policy=policy))
+
+    def test_penalty_depends_on_the_amount(self):
+        # 0.1% of the amount, at least 0.5 sat and at most 5 sat, plus 100 ppm
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        self.assertEqual(500 + 10, hints.penalty(a, b, channel(1), amount_msat=100_000))
+        self.assertEqual(2000 + 200, hints.penalty(a, b, channel(1), amount_msat=2_000_000))
+        self.assertEqual(5000 + 2000, hints.penalty(a, b, channel(1), amount_msat=20_000_000))
+
+    def test_penalty_factors_add_up(self):
+        # unknown liquidity (1), an htlc in flight (1), close to the known upper bound (2), failed node pair (10)
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        hints.update_cannot_send(a, b, channel(2), amount_msat=1_100_000)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=900_000, policy=policy)
+        hints.add_htlc(a, b, channel(2))
+        self.assertEqual((1000 + 100) * (1 + 1 + 2 + 10),
+                         hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+
+    def test_liquidity_hints_of_a_node_that_several_nodes_failed_to_forward_to(self):
+        # when several nodes failed to forward an amount to the same node, its inbound liquidity is
+        # probably drained, and its other incoming channels will likely fail too.
+        # Penalties: for 1_000_000 msat, 1000 + 100 msat, and 11 times that for such a node.
+        self.assertEqual((2, 10), (NODE_FAILURE_MIN_SENDERS, NODE_FAILURE_PENALTY_FACTOR))
+        hints = LiquidityHintMgr()
+        a, b, c, d, y = node('a'), node('b'), node('c'), node('d'), node('y')
+        hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000)
+        self.assertEqual(1100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))  # one node is not several
+        hints.update_cannot_send(a, y, channel(9), amount_msat=1_000_000)  # nor is another channel of the same node
+        self.assertEqual(1100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+        hints.update_cannot_send(b, y, channel(2), amount_msat=1_000_000)
+        self.assertEqual(12100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+        hints.update_cannot_send(c, y, channel(3), amount_msat=900_000)
+        self.assertEqual(12100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+        # not below the amounts that failed, not from y, not to another node
+        self.assertEqual(950 + 95, hints.penalty(d, y, channel(4), amount_msat=950_000))
+        self.assertEqual(1100, hints.penalty(y, d, channel(4), amount_msat=1_000_000))
+        self.assertEqual(1100, hints.penalty(d, a, channel(4), amount_msat=1_000_000))
+        # the other channels of a node that failed too
+        self.assertEqual(12100, hints.penalty(c, y, channel(8), amount_msat=1_000_000))
+        # a successful forward to y contradicts the failures of up to that amount, included
+        hints.update_can_send(d, y, channel(4), amount_msat=900_000)
+        self.assertEqual(12100, hints.penalty(d, y, channel(7), amount_msat=1_000_000))  # a and b failed for more
+        hints.update_can_send(d, y, channel(4), amount_msat=1_000_000)
+        self.assertEqual(1100, hints.penalty(d, y, channel(7), amount_msat=1_000_000))
+        self.assertEqual(0, hints.penalty(d, y, channel(4), amount_msat=900_000))
+        # reset
+        hints.update_cannot_send(c, y, channel(3), amount_msat=1_000_000)
+        hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000)
+        self.assertEqual(12100, hints.penalty(d, y, channel(7), amount_msat=1_000_000))
+        hints.reset_liquidity_hints()
+        self.assertEqual(1100, hints.penalty(d, y, channel(7), amount_msat=1_000_000))
+
+    def test_channels_into_a_node_that_cannot_receive_are_tried_from_about_twice_the_fee_that_failed(self):
+        # where liquidity is scarce it is expensive: not from the cheapest channel up, one by one
+        self.assertEqual(2, NODE_FAILURE_PRICE_STEP)
+        a, b, c, d, y = node('a'), node('b'), node('c'), node('d'), node('y')
+        amount_msat = 1_000_000  # so that the fee in msat is the rate in ppm, plus the base fee
+        node_failed = (1 + NODE_FAILURE_PENALTY_FACTOR) * 1100
+        def policy(ppm, base=0):
+            return base, ppm, 40
+        def penalty(hints, ppm, *, node_from=d, base=0, number=4):
+            return hints.penalty(node_from, y, channel(number), amount_msat=amount_msat, policy=policy(ppm, base))
+        hints = LiquidityHintMgr()
+        hints.update_cannot_send(a, y, channel(1), amount_msat=amount_msat, policy=policy(100))
+        self.assertEqual(1100, penalty(hints, 50))  # one node is not several
+        hints.update_cannot_send(b, y, channel(2), amount_msat=amount_msat, policy=policy(200))
+        # the highest fee that failed is 200: a channel that charges less than 400 gets twice what it lacks
+        for ppm, price_penalty in ((0, 800), (50, 700), (200, 400), (300, 200), (399, 2), (400, 0), (800, 0), (5000, 0)):
+            self.assertEqual(node_failed + price_penalty, penalty(hints, ppm), msg=ppm)
+        # the base fee counts as well: 150 + 50 ppm is 200
+        self.assertEqual(node_failed + 400, penalty(hints, 50, base=150))
+        # so with its fee added, a channel is the cheapest to try at twice the fee that failed,
+        # and gets more expensive the further from that it is, on either side
+        costs = [ppm + penalty(hints, ppm) for ppm in (0, 100, 200, 300, 399, 400, 500, 700, 800)]
+        self.assertEqual(min(costs), costs[5])
+        self.assertEqual(sorted(costs[:6], reverse=True), costs[:6])
+        self.assertEqual(sorted(costs[5:]), costs[5:])
+        self.assertLess(costs[7], costs[0])  # 700 comes before the cheapest ones
+        self.assertEqual(costs[8], costs[0])  # at 4 times the fee that failed, a channel costs what a free one does
+        # the other channels of the nodes that failed get it too, on top of what the pair gets
+        self.assertEqual(node_failed + PAIR_FAILURE_PENALTY_FACTOR * 1100 + 700, penalty(hints, 50, node_from=a, number=8))
+        # a more expensive channel fails: the step is from there
+        hints.update_cannot_send(c, y, channel(3), amount_msat=amount_msat, policy=policy(450))
+        self.assertEqual(node_failed + 2 * (900 - 500), penalty(hints, 500))
+        self.assertEqual(node_failed, penalty(hints, 900))
+        # of the channels of one node that failed, the most expensive counts, whatever the order
+        hints.update_cannot_send(c, y, channel(5), amount_msat=amount_msat, policy=policy(300))
+        self.assertEqual(node_failed, penalty(hints, 900))
+        self.assertEqual(node_failed + 2 * (900 - 700), penalty(hints, 700))
+        hints.update_cannot_send(c, y, channel(6), amount_msat=amount_msat, policy=policy(600))
+        self.assertEqual(node_failed + 2 * (1200 - 900), penalty(hints, 900))
+        # not below the amounts that failed, not to another node, not without the policy of the channel
+        self.assertEqual(990, hints.penalty(d, y, channel(4), amount_msat=900_000, policy=policy(50)))
+        self.assertEqual(1100, hints.penalty(d, a, channel(4), amount_msat=amount_msat, policy=policy(50)))
+        self.assertEqual(node_failed, hints.penalty(d, y, channel(4), amount_msat=amount_msat))
+        # a channel that is known to be able to forward the amount is free as before
+        hints.update_can_send(d, y, channel(7), amount_msat=amount_msat // 2, policy=policy(50))
+        self.assertEqual(0, hints.penalty(d, y, channel(7), amount_msat=amount_msat // 2, policy=policy(50)))
+        # a forward of the amount to y ends it
+        hints.update_can_send(d, y, channel(7), amount_msat=amount_msat, policy=policy(50))
+        self.assertEqual(1100, penalty(hints, 300))
+        self.assertEqual({}, hints._node_failed_policies)
+
+    def test_fee_of_the_channels_into_a_node_does_not_count_if_we_do_not_know_what_those_that_failed_charge(self):
+        a, b, d, y = node('a'), node('b'), node('d'), node('y')
+        node_failed = (1 + NODE_FAILURE_PENALTY_FACTOR) * 1100
+        hints = LiquidityHintMgr()
+        hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000)
+        hints.update_cannot_send(b, y, channel(2), amount_msat=1_000_000)
+        self.assertEqual(node_failed, hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 50, 40)))
+        # of one of them we do
+        hints.update_cannot_send(b, y, channel(3), amount_msat=1_000_000, policy=(0, 200, 40))
+        self.assertEqual(node_failed + 700, hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 50, 40)))
+        # a later failure of it that comes without the policy: we cannot tell any more
+        hints.update_cannot_send(b, y, channel(5), amount_msat=1_000_000)
+        self.assertEqual(node_failed, hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 50, 40)))
+
+    def test_fee_of_the_channels_that_failed_into_a_node_expires_and_is_reset_with_the_failures(self):
+        a, b, d, y = node('a'), node('b'), node('d'), node('y')
+        node_failed = (1 + NODE_FAILURE_PENALTY_FACTOR) * 1100
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints = LiquidityHintMgr()
+            hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000, policy=(0, 100, 40))
+            mock_time = start + HINT_DURATION - 10
+            hints.update_cannot_send(b, y, channel(2), amount_msat=1_000_000, policy=(0, 50, 40))
+            self.assertEqual(node_failed + 2 * (200 - 20), hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 20, 40)))
+            # the failure of a expires: one node is left, and its fee does not count by itself
+            mock_time = start + HINT_DURATION + 1
+            self.assertEqual(1100, hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 20, 40)))
+            # a fails again, for less: what counts is what failed this time
+            hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000, policy=(0, 30, 40))
+            self.assertEqual(node_failed + 2 * (100 - 20), hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 20, 40)))
+            hints.reset_liquidity_hints()
+            self.assertEqual({}, hints._node_failed_policies)
+            self.assertEqual(1100, hints.penalty(d, y, channel(4), amount_msat=1_000_000, policy=(0, 20, 40)))
+
+    def test_liquidity_hints_of_a_node_keep_the_smallest_amount_that_failed_per_node(self):
+        hints = LiquidityHintMgr()
+        a, b, c, d, y = node('a'), node('b'), node('c'), node('d'), node('y')
+        hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000)
+        hints.update_cannot_send(a, y, channel(5), amount_msat=800_000)
+        hints.update_cannot_send(b, y, channel(2), amount_msat=800_000)
+        hints.update_cannot_send(c, y, channel(3), amount_msat=800_000)
+        self.assertEqual(11 * (900 + 90), hints.penalty(d, y, channel(4), amount_msat=900_000))
+        hints.update_cannot_send(a, y, channel(6), amount_msat=2_000_000)  # larger: does not replace it
+        self.assertEqual(11 * (900 + 90), hints.penalty(d, y, channel(4), amount_msat=900_000))
+
+    def test_liquidity_hints_of_a_node_are_replaced_not_changed(self):
+        # as penalty() reads them without the lock
+        hints = LiquidityHintMgr()
+        a, b, d, y = node('a'), node('b'), node('d'), node('y')
+        hints.update_cannot_send(a, y, channel(1), amount_msat=1_000_000)
+        published = hints._node_cannot_receive[y]
+        before = (published[0], dict(published[1]))
+        hints.update_cannot_send(b, y, channel(2), amount_msat=1_000_000)
+        hints.update_can_send(d, y, channel(4), amount_msat=500_000)
+        hints.update_can_send(d, y, channel(4), amount_msat=2_000_000)
+        self.assertEqual(before, (published[0], dict(published[1])))
+        self.assertNotIn(y, hints._node_cannot_receive)
+
+    def test_liquidity_hints_of_a_node_keep_a_channel_that_forwarded_the_amount(self):
+        # the failures of other nodes to forward to y do not tell anything about this channel to y
+        hints = LiquidityHintMgr()
+        a, b, c, d, y = node('a'), node('b'), node('c'), node('d'), node('y')
+        hints.update_can_send(d, y, channel(4), amount_msat=1_200_000)
+        for n, sender in enumerate((a, b, c)):
+            hints.update_cannot_send(sender, y, channel(n), amount_msat=1_000_000)
+        self.assertEqual(0, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+        self.assertEqual(12100, hints.penalty(d, y, channel(5), amount_msat=1_000_000))
+
+    def test_liquidity_hints_of_a_node_that_several_nodes_failed_to_forward_to_expire(self):
+        hints = LiquidityHintMgr()
+        a, b, c, d, y = node('a'), node('b'), node('c'), node('d'), node('y')
+        for n, sender in enumerate((a, b, c)):
+            hints.update_cannot_send(sender, y, channel(n), amount_msat=1_000_000)
+        self.assertEqual(12100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+        later = int(time.time()) + HINT_DURATION + 1
+        with mock.patch('electrum.lnrouter.now', return_value=later):
+            self.assertEqual(1100, hints.penalty(d, y, channel(4), amount_msat=1_000_000))
+            # expired failures are dropped when the node gets another one, which replaces them
+            hints.update_cannot_send(a, y, channel(0), amount_msat=2_000_000)
+            self.assertEqual([a], list(hints._node_cannot_receive[y][1]))
+            hints.update_cannot_send(b, y, channel(1), amount_msat=2_000_000)
+            hints.update_cannot_send(c, y, channel(2), amount_msat=2_000_000)
+            self.assertEqual(24200, hints.penalty(d, y, channel(4), amount_msat=2_000_000))
+
+    def test_liquidity_hints_of_a_node_pair_compare_fees_at_the_amount_sent(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        high_base, high_proportional = (10_000, 0, 40), (0, 1000, 40)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=high_base)
+        default = LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=1_000_000, policy=high_proportional)
+        # at 1_000_000 msat, high_proportional has the lower fee (1000 msat), at 20_000_000 msat the higher one
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default,
+                         hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=high_proportional))
+        default = LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=20_000_000, policy=high_proportional)
+        self.assertEqual(default, hints.penalty(a, b, channel(2), amount_msat=20_000_000, policy=high_proportional))
+
+    def test_liquidity_hints_of_a_node_pair_override_an_older_success_of_a_parallel_channel(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        hints.update_can_send(a, b, channel(2), amount_msat=2_000_000, policy=policy)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        default = LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=1_500_000, policy=policy)
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default,
+                         hints.penalty(a, b, channel(2), amount_msat=1_500_000, policy=policy))
+
+    def test_liquidity_hints_of_a_node_pair_with_an_outdated_policy(self):
+        # nodes often change the policies of all their channels to the same node together
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        amount_msat = 1_000_000
+        outdated, cheaper, updated, longer_cltv = (1000, 70, 40), (1000, 60, 40), (1000, 80, 40), (1000, 70, 41)
+        def default(policy, n_from=a, n_to=b):
+            return LiquidityHintMgr().penalty(n_from, n_to, channel(2), amount_msat=amount_msat, policy=policy)
+        def penalty(policy, n_from=a, n_to=b):
+            return hints.penalty(n_from, n_to, channel(2), amount_msat=amount_msat, policy=policy)
+        factor = 1 + PAIR_FAILURE_PENALTY_FACTOR
+        hints.update_outdated_policy(a, b, policy=outdated)
+        self.assertEqual(factor * default(outdated), penalty(outdated))
+        self.assertEqual(factor * default(cheaper), penalty(cheaper))
+        self.assertEqual(default(updated), penalty(updated))  # e.g. the channel with the new policy
+        self.assertEqual(default(longer_cltv), penalty(longer_cltv))
+        self.assertEqual(default(outdated, b, a), penalty(outdated, b, a))  # other direction
+        # a later report adds its outdated policy
+        hints.update_outdated_policy(a, b, policy=cheaper)
+        self.assertEqual(factor * default(outdated), penalty(outdated))
+        hints.update_outdated_policy(a, b, policy=(0, 200, 40))
+        self.assertEqual(factor * default((0, 200, 40)), penalty((0, 200, 40)))
+        self.assertEqual(factor * default(outdated), penalty(outdated))
+        self.assertEqual(default((1000, 200, 40)), penalty((1000, 200, 40)))  # e.g. a policy with both changes
+        # not a liquidity failure: no node hint
+        c, d, e = node('c'), node('d'), node('e')
+        for n_from in (c, d, e):
+            hints.update_outdated_policy(n_from, b, policy=outdated)
+        self.assertEqual(default(outdated, node('f')), penalty(outdated, node('f')))
+        # a forward over a more expensive channel, e.g. the one with the new policy, does not change it
+        hints.update_can_send(a, b, channel(3), amount_msat=amount_msat, policy=(3000, 70, 40))
+        self.assertEqual(factor * default(outdated), penalty(outdated))
+        # a forward with a policy that is not more expensive shows that the node pair's policies are current
+        hints.update_can_send(a, b, channel(3), amount_msat=amount_msat, policy=outdated)
+        self.assertEqual(default(outdated), penalty(outdated))
+        # the oldest of more than MAX_OUTDATED_POLICIES_PER_PAIR are dropped
+        hints.reset_liquidity_hints()
+        dearest = (1000, 100, 40)
+        hints.update_outdated_policy(a, b, policy=dearest)
+        for ppm in range(10, 10 + 10 * MAX_OUTDATED_POLICIES_PER_PAIR, 10):
+            hints.update_outdated_policy(a, b, policy=(1000, ppm, 40))
+            self.assertEqual(ppm < 10 * MAX_OUTDATED_POLICIES_PER_PAIR, penalty(dearest) > default(dearest))
+        # it expires, unless reported again
+        start = int(time.time())
+        with mock.patch('electrum.lnrouter.now', return_value=start):
+            hints.update_outdated_policy(a, b, policy=outdated)
+        with mock.patch('electrum.lnrouter.now', return_value=start + HINT_DURATION - 600):
+            hints.update_outdated_policy(a, b, policy=outdated)
+        with mock.patch('electrum.lnrouter.now', return_value=start + HINT_DURATION + 1):
+            self.assertEqual(factor * default(outdated), penalty(outdated))
+        with mock.patch('electrum.lnrouter.now', return_value=start + 2 * HINT_DURATION):
+            self.assertEqual(default(outdated), penalty(outdated))
+            # and is dropped when another node pair is reported
+            hints.update_outdated_policy(c, b, policy=outdated)
+            self.assertEqual({(c, b)}, set(hints._pair_outdated_policy))
+        hints.update_outdated_policy(a, b, policy=outdated)
+        hints.reset_liquidity_hints()
+        self.assertEqual(default(outdated), penalty(outdated))
+
+    def test_liquidity_hints_of_a_node_pair_expire(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=amount_msat, policy=policy)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default(1_000_000),
+                         hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+        later = int(time.time()) + FAILURE_MEMORY_DURATION + 1
+        with mock.patch('electrum.lnrouter.now', return_value=later):
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+        later = int(time.time()) + HINT_DURATION + 1
+        with mock.patch('electrum.lnrouter.now', return_value=later):
+            # an expired failure is remembered for some time, see the tests of old failures
+            self.assertLess(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+            self.assertGreater((1 + PAIR_FAILURE_PENALTY_FACTOR) * default(1_000_000),
+                               hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+            # an expired failure is replaced by a newer one, even of a larger amount
+            hints.update_cannot_send(a, b, channel(1), amount_msat=2_000_000, policy=policy)
+            self.assertEqual(default(1_500_000), hints.penalty(a, b, channel(2), amount_msat=1_500_000, policy=policy))
+            self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR) * default(2_000_000),
+                             hints.penalty(a, b, channel(2), amount_msat=2_000_000, policy=policy))
 
     def test_liquidity_hints_expiry(self):
         liquidity_hints = LiquidityHintMgr()
@@ -396,6 +3247,579 @@ class Test_LNRouter(ElectrumTestCase):
             liquidity_hints.update_can_send(node_from, node_to, channel_id, amount_msat=5_000)
             hint = liquidity_hints.get_hint(channel_id)
             self.assertEqual(5_000, hint.can_send(node_from < node_to))
+
+    @staticmethod
+    def _old_failure_penalty(default_penalty: float, age: int) -> float:
+        weight = (FAILURE_MEMORY_DURATION - age) / (FAILURE_MEMORY_DURATION - HINT_DURATION)
+        return default_penalty * (1 + OLD_FAILURE_PENALTY_FACTOR * weight)
+
+    def test_old_failure_of_a_channel_is_a_penalty_that_fades_out(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=amount_msat)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000)
+            mock_time = start + HINT_DURATION
+            self.assertEqual(inf, hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            # then the channel is not excluded any more, but is to be tried after others
+            mock_time = start + HINT_DURATION + 1
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), HINT_DURATION + 1),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=0.001)
+            self.assertLess(10 * default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            self.assertAlmostEqual(self._old_failure_penalty(default(3_000_000), HINT_DURATION + 1),
+                                   hints.penalty(a, b, channel(1), amount_msat=3_000_000), delta=0.001)
+            # smaller amounts, the other direction and other channels are not affected
+            self.assertEqual(default(999_999), hints.penalty(a, b, channel(1), amount_msat=999_999))
+            self.assertEqual(default(1_000_000), hints.penalty(b, a, channel(1), amount_msat=1_000_000))
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000))
+            # the penalty fades out
+            halfway = (HINT_DURATION + FAILURE_MEMORY_DURATION) // 2
+            mock_time = start + halfway
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), halfway),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=0.001)
+            self.assertAlmostEqual((1 + OLD_FAILURE_PENALTY_FACTOR / 2) * default(1_000_000),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000), delta=1)
+            mock_time = start + FAILURE_MEMORY_DURATION - 1
+            self.assertLess(default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            self.assertGreater(1.01 * default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+            # until the failure is forgotten
+            mock_time = start + FAILURE_MEMORY_DURATION
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(1), amount_msat=1_000_000))
+
+    def test_how_long_and_how_much_an_old_failure_counts(self):
+        # the tests of old failures compute what they expect from these
+        self.assertEqual(3600, HINT_DURATION)
+        self.assertEqual(7 * 24 * 3600, FAILURE_MEMORY_DURATION)
+        self.assertEqual(10, OLD_FAILURE_PENALTY_FACTOR)
+        self.assertEqual(1100 * (1 + 10 * 0.5), self._old_failure_penalty(1100, (3600 + 7 * 24 * 3600) // 2))
+
+    def test_failure_we_still_rely_on_is_not_over_when_just_that_amount_gets_through(self):
+        # as it was before old failures were remembered
+        a, b = node('a'), node('b')
+        for forward in (True, False):
+            node_from, node_to = (a, b) if forward else (b, a)
+            hints = LiquidityHintMgr()
+            hints.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+            hints.update_can_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+            self.assertEqual(inf, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=forward)
+            hints.update_can_send(node_from, node_to, channel(1), amount_msat=1_000_001)
+            self.assertEqual(0, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=forward)
+
+    def test_newer_failure_of_a_larger_amount_does_not_erase_an_old_one_of_a_smaller_amount(self):
+        a, b = node('a'), node('b')
+        self.assertLess(a, b)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=amount_msat)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            for forward in (True, False):
+                node_from, node_to = (a, b) if forward else (b, a)
+                def penalty(amount_msat, hints, node_from=node_from, node_to=node_to):
+                    return hints.penalty(node_from, node_to, channel(1), amount_msat=amount_msat)
+                original = LiquidityHintMgr()
+                mock_time = start
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=250_000)
+                age = 3 * HINT_DURATION
+                mock_time = start + age
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, original), delta=0.001)
+                restored = LiquidityHintMgr()
+                self.assertEqual(1, restored.import_state(json.loads(json.dumps(original.export_state()))))
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, restored), delta=0.001)
+                # e.g. the first attempt of the next payment, before it gets split
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+                self.assertEqual(inf, penalty(1_000_000, original))
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age), penalty(500_000, original), delta=0.001)
+                self.assertEqual(default(249_999), penalty(249_999, original))
+                # the next session knows both too
+                restored = LiquidityHintMgr()
+                restored.import_state(json.loads(json.dumps(original.export_state())))
+                self.assertEqual(inf, penalty(1_000_000, restored))
+                self.assertAlmostEqual(
+                    self._old_failure_penalty(default(500_000), age), penalty(500_000, restored), delta=0.001)
+                self.assertEqual(default(249_999), penalty(249_999, restored))
+                # once the newer one is old too, it is the one that counts for the amounts it tells about
+                mock_time = start + age + 2 * HINT_DURATION
+                for hints in (original, restored):
+                    self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age + 2 * HINT_DURATION),
+                                           penalty(500_000, hints), delta=0.001)
+                    self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), 2 * HINT_DURATION),
+                                           penalty(1_000_000, hints), delta=0.001)
+                # a failure of an even larger amount: the one of the smallest amount is kept besides it
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=2_000_000)
+                self.assertEqual(inf, penalty(2_000_000, original))
+                self.assertAlmostEqual(self._old_failure_penalty(default(1_500_000), age + 2 * HINT_DURATION),
+                                       penalty(1_500_000, original), delta=0.001)
+                self.assertAlmostEqual(self._old_failure_penalty(default(500_000), age + 2 * HINT_DURATION),
+                                       penalty(500_000, original), delta=0.001)
+                # a forward of an amount in between ends the failure of the smaller amount only
+                original.update_can_send(node_from, node_to, channel(1), amount_msat=600_000)
+                self.assertEqual(0, penalty(500_000, original))
+                self.assertEqual(inf, penalty(2_000_000, original))
+                mock_time += HINT_DURATION + 1
+                self.assertEqual(default(500_000), penalty(500_000, original))
+                self.assertLess(default(2_000_000), penalty(2_000_000, original))
+                self.assertNotEqual(inf, penalty(2_000_000, original))
+                # a failure of a smaller amount replaces the old ones: it tells more
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=100_000)
+                hint = original.get_hint(channel(1))
+                self.assertIsNone(hint._old_cannot_send_forward)
+                self.assertIsNone(hint._old_cannot_send_backward)
+                self.assertEqual(inf, penalty(100_000, original))
+                # and what is forgotten is not kept besides a new failure
+                mock_time += FAILURE_MEMORY_DURATION + 1
+                original.update_cannot_send(node_from, node_to, channel(1), amount_msat=3_000_000)
+                self.assertIsNone(hint._old_cannot_send_forward)
+                self.assertIsNone(hint._old_cannot_send_backward)
+                self.assertEqual(default(500_000), penalty(500_000, original))
+
+    def test_old_failure_of_a_channel_is_over_when_the_amount_gets_through(self):
+        a, b = node('a'), node('b')
+        default = LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=1_000_000)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            for node_from, node_to, sent_amount_msat, is_over in (
+                    (a, b, 999_999, False), (a, b, 1_000_000, True), (a, b, 2_000_000, True),
+                    (b, a, 999_999, False), (b, a, 1_000_000, True), (b, a, 2_000_000, True)):
+                msg = (node_from < node_to, sent_amount_msat)
+                hints = LiquidityHintMgr()
+                mock_time = start
+                hints.update_cannot_send(node_from, node_to, channel(1), amount_msat=1_000_000)
+                mock_time = start + 2 * HINT_DURATION
+                self.assertLess(default, hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000), msg=msg)
+                hints.update_can_send(node_from, node_to, channel(1), amount_msat=sent_amount_msat)
+                # once we do not rely on that success any more either
+                mock_time = start + 3 * HINT_DURATION + 1
+                penalty = hints.penalty(node_from, node_to, channel(1), amount_msat=1_000_000)
+                if is_over:
+                    self.assertEqual(default, penalty, msg=msg)
+                else:
+                    self.assertAlmostEqual(self._old_failure_penalty(default, 3 * HINT_DURATION + 1), penalty,
+                                           delta=0.001, msg=msg)
+
+    def test_old_failure_of_a_node_pair_is_a_penalty_for_its_parallel_channels(self):
+        hints = LiquidityHintMgr()
+        a, b = node('a'), node('b')
+        policy, more_expensive = (1000, 100, 40), (2000, 100, 40)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(a, b, channel(2), amount_msat=amount_msat, policy=policy)
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+            age = 5 * HINT_DURATION
+            mock_time = start + age
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), age),
+                                   hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # as with a failure we still rely on: not for smaller amounts, more expensive channels, the way back
+            self.assertEqual(default(999_999), hints.penalty(a, b, channel(2), amount_msat=999_999, policy=policy))
+            self.assertEqual(default(1_000_000),
+                             hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=more_expensive))
+            self.assertEqual(default(1_000_000), hints.penalty(b, a, channel(2), amount_msat=1_000_000, policy=policy))
+            # the channel that failed does not get it twice
+            self.assertAlmostEqual(self._old_failure_penalty(default(1_000_000), age),
+                                   hints.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # a forward over a parallel channel that is not more expensive ends it
+            hints.update_can_send(a, b, channel(3), amount_msat=1_000_000, policy=policy)
+            self.assertEqual(default(1_000_000), hints.penalty(a, b, channel(2), amount_msat=1_000_000, policy=policy))
+
+    async def test_find_path_steps_up_the_fees_of_the_channels_into_a_node_that_cannot_receive(self):
+        # s - h - a1..a6 - x - d: the channels a_i -> x charge more and more, the rest is free
+        s, h, x, d = node('s'), node('h'), node('x'), node('d')
+        senders = {character: node(character) for character in 'abcefg'}
+        fees = {'a': 100, 'b': 110, 'c': 120, 'e': 130, 'f': 250, 'g': 600}  # ppm of their channel to x
+        free = (0, 0, 40)
+        chans = [(40, s, h, free, free), (59, x, d, free, free)]
+        for i, (character, sender) in enumerate(senders.items()):
+            chans.append((41 + i, h, sender, free, free))
+            chans.append((51 + i, sender, x, (0, fees[character], 40), free))
+        self._make_graph(chans)
+        amount_msat = 1_000_000
+        by_node = {sender: character for character, sender in senders.items()}
+        tried = []
+        def try_next_path():
+            path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+            self.assertEqual([h, x, d], [edge.end_node for edge in path if edge.end_node not in by_node])
+            route = self.path_finder.create_route_from_path(path)
+            tried.append(by_node[route[2].start_node])
+            # the channel into x cannot forward
+            self.path_finder.update_liquidity_hints(route, amount_msat, failing_channel=route[2].short_channel_id)
+        for _ in range(len(senders)):
+            try_next_path()
+        # The two cheapest, then not the next cheapest ones: 250 is the first at twice the 110 that failed,
+        # and 600 the first at twice 250. The cheap ones that got skipped are not excluded: they come last.
+        self.assertEqual(['a', 'b', 'f', 'g', 'e', 'c'], tried)
+        self.assertIsNone(self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat))
+        # a smaller amount is not affected
+        path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat // 2)
+        self.assertEqual(senders['a'], path[1].end_node)
+
+    async def test_find_path_tries_a_channel_with_an_old_failure_after_others_but_does_not_exclude_it(self):
+        s, a, b, d = node('s'), node('a'), node('b'), node('d')
+        free, one_sat = (0, 0, 40), (1000, 0, 40)
+        amount_msat = 1_000_000
+        def find():
+            path = self.path_finder.find_path_for_payment(nodeA=s, nodeB=d, invoice_amount_msat=amount_msat)
+            return path and [edge.end_node for edge in path]
+        start = mock_time = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            self._make_graph([(41, s, a, free, free), (42, a, d, free, free),
+                              (43, s, b, free, free), (44, b, d, one_sat, free)])
+            self.assertEqual([a, d], find())
+            # no policy: so that it is the failure of the channel that counts, not that of the node pair
+            self.path_finder.liquidity_hints.update_cannot_send(a, d, channel(42), amount_msat=amount_msat)
+            self.assertEqual([b, d], find())
+            mock_time = start + 3 * HINT_DURATION
+            self.assertEqual([b, d], find())  # without the memory of the failure, the path through a again
+            mock_time = start + FAILURE_MEMORY_DURATION
+            self.assertEqual([a, d], find())
+            # it is the only path
+            self.cdb.stop()
+            await self.cdb.stopped_event.wait()
+            self._make_graph([(41, s, a, free, free), (42, a, d, free, free)])
+            mock_time = start
+            self.path_finder.liquidity_hints.update_cannot_send(a, d, channel(42), amount_msat=amount_msat)
+            self.assertIsNone(find())
+            mock_time = start + HINT_DURATION + 1
+            self.assertEqual([a, d], find())
+
+    @staticmethod
+    def _record_liquidity(hints: LiquidityHintMgr) -> LiquidityHintMgr:
+        a, b, c, d, e = (node(x) for x in 'abcde')
+        policy = (1000, 100, 40)
+        hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        hints.update_can_send(a, b, channel(1), amount_msat=200_000, policy=policy)
+        hints.update_can_send(b, a, channel(2), amount_msat=300_000, policy=policy)
+        for number, sender in ((11, c), (12, d), (13, e)):  # b cannot receive
+            hints.update_cannot_send(sender, b, channel(number), amount_msat=500_000, policy=policy)
+        return hints
+
+    def _assert_same_liquidity(self, expected: LiquidityHintMgr, hints: LiquidityHintMgr):
+        a, b, c, x = node('a'), node('b'), node('c'), node('x')
+        policy = (1000, 100, 40)
+        penalties = []
+        for node_from, node_to, number in ((a, b, 1), (b, a, 1), (a, b, 2), (b, a, 2), (a, b, 3), (c, b, 11),
+                                           (b, c, 11), (c, b, 14), (x, b, 15), (x, a, 16)):
+            for amount_msat in (100_000, 200_000, 250_000, 300_000, 500_000, 900_000, 1_000_000, 2_000_000):
+                penalties.append(expected.penalty(node_from, node_to, channel(number), amount_msat=amount_msat, policy=policy))
+                self.assertEqual(
+                    penalties[-1],
+                    hints.penalty(node_from, node_to, channel(number), amount_msat=amount_msat, policy=policy),
+                    msg=(node_from, node_to, number, amount_msat))
+        self.assertGreater(len(set(penalties)), 10)  # the probes tell the hints apart
+
+    def test_liquidity_hints_are_exported_and_imported(self):
+        hints = self._record_liquidity(LiquidityHintMgr())
+        hints.add_htlc(node('a'), node('b'), channel(1))
+        hints.update_outdated_policy(node('a'), node('b'), policy=(1000, 100, 40))
+        state = json.loads(json.dumps(hints.export_state()))
+        restored = LiquidityHintMgr()
+        # 5 channels, 4 node pairs, 1 node that several nodes failed to forward to
+        self.assertEqual(10, restored.import_state(state))
+        # as before, but for the htlc in flight and the outdated policy
+        self._assert_same_liquidity(self._record_liquidity(LiquidityHintMgr()), restored)
+        # each kind of hint is there
+        a, b, x = node('a'), node('b'), node('x')
+        policy = (1000, 100, 40)
+        def default(amount_msat):
+            return LiquidityHintMgr().penalty(x, b, channel(15), amount_msat=amount_msat, policy=policy)
+        self.assertEqual(inf, restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy))
+        self.assertEqual(0, restored.penalty(a, b, channel(1), amount_msat=200_000, policy=policy))
+        self.assertEqual(0, restored.penalty(b, a, channel(2), amount_msat=300_000, policy=policy))
+        self.assertEqual(default(250_000), restored.penalty(a, b, channel(1), amount_msat=250_000, policy=policy))
+        # (the channels that failed into b charge as much as this one: it gets twice what it lacks to their double)
+        self.assertEqual((1 + NODE_FAILURE_PENALTY_FACTOR) * default(500_000) + 2 * (1000 + 50),
+                         restored.penalty(x, b, channel(15), amount_msat=500_000, policy=policy))
+        self.assertEqual((1 + PAIR_FAILURE_PENALTY_FACTOR + NODE_FAILURE_PENALTY_FACTOR) * default(1_000_000)
+                         + 2 * (1000 + 100),
+                         restored.penalty(a, b, channel(3), amount_msat=1_000_000, policy=policy))
+        # a saved state without what the channels that failed charge, as earlier versions wrote it, is fine too
+        without_policies = json.loads(json.dumps(state))
+        for failures in without_policies['nodes'].values():
+            for sender in failures:
+                self.assertEqual(3, len(failures[sender]))
+                failures[sender] = failures[sender][:2]
+        older = LiquidityHintMgr()
+        self.assertEqual(10, older.import_state(without_policies))
+        self.assertEqual((1 + NODE_FAILURE_PENALTY_FACTOR) * default(500_000),
+                         older.penalty(x, b, channel(15), amount_msat=500_000, policy=policy))
+        self.assertEqual(state, json.loads(json.dumps(restored.export_state())))
+        self.assertEqual(0, restored.import_state(state))  # nothing new
+
+    def test_imported_liquidity_hints_keep_their_age(self):
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        default = LiquidityHintMgr().penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        empty = {'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}}
+        start = mock_time = 1_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            hints = LiquidityHintMgr()
+            self.assertEqual(empty, hints.export_state())
+            hints.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+            hints.update_can_send(a, b, channel(2), amount_msat=400_000)
+            state = hints.export_state()
+            # later within the hour: hints we still rely on
+            mock_time = start + HINT_DURATION - 60
+            restored = LiquidityHintMgr()
+            self.assertEqual(4, restored.import_state(state))  # 2 channels, the node pair, the node
+            self.assertEqual(inf, restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy))
+            self.assertEqual(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+            mock_time = start + HINT_DURATION + 1  # they expire when those of the earlier session would
+            self.assertAlmostEqual(self._old_failure_penalty(default, HINT_DURATION + 1),
+                                   restored.penalty(a, b, channel(1), amount_msat=1_000_000, policy=policy), delta=0.001)
+            self.assertLess(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+            # hours later: only the failures are kept, as old ones
+            age = 6 * HINT_DURATION
+            mock_time = start + age
+            state_later = hints.export_state()
+            self.assertEqual([channel(1).hex()], list(state_later['channels']))
+            self.assertEqual(1, len(state_later['pairs']))
+            self.assertEqual({}, state_later['nodes'])
+            for exported in (state, state_later):
+                restored = LiquidityHintMgr()
+                self.assertEqual(2, restored.import_state(json.loads(json.dumps(exported))))  # the channel, the pair
+                for number in (1, 3):  # the channel, a parallel one
+                    self.assertAlmostEqual(
+                        self._old_failure_penalty(default, age),
+                        restored.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # forgotten
+            mock_time = start + FAILURE_MEMORY_DURATION + 1
+            self.assertEqual(empty, hints.export_state())
+            restored = LiquidityHintMgr()
+            self.assertEqual(0, restored.import_state(state))
+            self.assertEqual(empty, restored.export_state())
+            # The clock was set back since the hints got saved: we cannot tell their age, so we do not rely
+            # on them. The failures, of the channel and of the pair, are taken as ones that have just expired.
+            for clock_set_back_by in (1, 10 * FAILURE_MEMORY_DURATION):
+                mock_time = start - clock_set_back_by
+                restored = LiquidityHintMgr()
+                self.assertEqual(2, restored.import_state(state), msg=clock_set_back_by)
+                for number in (1, 3):
+                    self.assertAlmostEqual(
+                        self._old_failure_penalty(default, HINT_DURATION + 1),
+                        restored.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+                self.assertLess(0, restored.penalty(a, b, channel(2), amount_msat=400_000, policy=policy))
+                self.assertEqual({}, restored._node_cannot_receive)
+
+    def test_liquidity_hints_we_have_take_precedence_over_imported_ones(self):
+        a, b, c = node('a'), node('b'), node('c')
+        policy = (1000, 100, 40)
+        earlier = LiquidityHintMgr()
+        earlier.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        earlier.update_cannot_send(a, c, channel(5), amount_msat=1_000_000, policy=policy)
+        state = earlier.export_state()
+        hints = LiquidityHintMgr()
+        hints.update_can_send(a, b, channel(1), amount_msat=3_000_000, policy=policy)
+        hints.update_cannot_send(c, b, channel(7), amount_msat=2_000_000, policy=policy)
+        # only what is about a -> c: we know better what a can send to b, and the failures of the pair a -> b
+        # and of a to b are older than our forward, which would have dropped them
+        self.assertEqual(3, hints.import_state(state))  # the channel, the pair, the node
+        self.assertEqual(0, hints.penalty(a, b, channel(1), amount_msat=3_000_000, policy=policy))
+        self.assertEqual(inf, hints.penalty(a, c, channel(5), amount_msat=1_000_000, policy=policy))
+        self.assertEqual({(c, b), (a, c)}, set(hints._pair_cannot_send))
+        self.assertEqual({b, c}, set(hints._node_cannot_receive))
+        self.assertEqual({c}, set(hints._node_cannot_receive[b][1]))
+
+    def test_saved_hints_of_another_wallet_are_taken_over_too(self):
+        # wallets share the path finder. the second one to take over its hints, before any htlc
+        a, b, c, d = node('a'), node('b'), node('c'), node('d')
+        policy = (1000, 100, 40)
+        of_a, of_b = LiquidityHintMgr(), LiquidityHintMgr()
+        of_a.update_cannot_send(a, b, channel(1), amount_msat=1_000_000, policy=policy)
+        of_b.update_cannot_send(c, b, channel(2), amount_msat=2_000_000, policy=policy)
+        of_b.update_cannot_send(a, b, channel(3), amount_msat=3_000_000, policy=(2000, 200, 40))
+        of_b.update_cannot_send(c, d, channel(4), amount_msat=4_000_000, policy=policy)
+        hints = LiquidityHintMgr()
+        self.assertEqual(3, hints.import_state(of_a.export_state()))  # the channel, the pair, the node
+        # all of it, but what we have: the failure of the pair a -> b, and of a to b
+        self.assertEqual(3 + 2 + 2, hints.import_state(of_b.export_state()))  # channels, pairs, nodes
+        self.assertEqual({(a, b), (c, b), (c, d)}, set(hints._pair_cannot_send))
+        self.assertEqual(1_000_000, hints._pair_cannot_send[(a, b)][0].amount_msat)
+        self.assertEqual({a, c}, set(hints._node_cannot_receive[b][1]))
+        self.assertEqual(1_000_000, hints._node_cannot_receive[b][1][a].amount_msat)  # what we had
+        self.assertEqual({a: policy, c: policy}, hints._node_failed_policies[b])
+        self.assertEqual({c}, set(hints._node_cannot_receive[d][1]))
+
+    def test_saved_failures_that_a_later_forward_is_over_are_not_taken_over(self):
+        a, b, c, d = node('a'), node('b'), node('c'), node('d')
+        policy = (1000, 100, 40)
+        start = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: start):
+            saved = LiquidityHintMgr()
+            saved.update_cannot_send(a, b, channel(1), amount_msat=2000, policy=policy)
+            saved.update_cannot_send(c, d, channel(2), amount_msat=2000, policy=policy)
+            state = saved.export_state()
+        with mock.patch.object(lnrouter, 'now', lambda: start + 10):
+            hints = LiquidityHintMgr()
+            # later: a forwarded a larger amount to b, which received it. c forwarded a smaller one to d
+            for amount_msat in (500, 3000, 500):  # (the largest one counts, not the first or the last)
+                hints.update_can_send(a, b, channel(3), amount_msat=amount_msat, policy=policy)
+            hints.update_can_send(c, d, channel(4), amount_msat=1000, policy=policy)
+            # a failure of ours does not count: it does not tell the saved failures are over
+            hints.update_cannot_send(b, c, channel(5), amount_msat=1000, policy=policy)
+            hints.import_state(state)
+        self.assertEqual({(c, d), (b, c)}, set(hints._pair_cannot_send))
+        self.assertNotIn(b, hints._node_cannot_receive)
+        self.assertEqual({c}, set(hints._node_cannot_receive[d][1]))
+        # a forward before the failure tells nothing about it
+        with mock.patch.object(lnrouter, 'now', lambda: start - 10):
+            hints = LiquidityHintMgr()
+            hints.update_can_send(a, b, channel(3), amount_msat=3000, policy=policy)
+        with mock.patch.object(lnrouter, 'now', lambda: start + 10):
+            hints.import_state(state)
+        self.assertEqual({(a, b), (c, d)}, set(hints._pair_cannot_send))
+        hints.reset_liquidity_hints()
+        self.assertEqual({}, hints._pair_forwarded)
+        self.assertEqual({}, hints._node_received)
+
+    def test_result_of_an_htlc_over_a_route_without_the_channel_that_failed(self):
+        with self.assertRaises(AssertionError):  # a bug of the caller
+            LiquidityHintMgr().update_from_route(self._liquidity_route(42), 1000, failing_channel=channel(99))
+
+    def test_export_of_hints_does_not_fail_when_a_failure_expires_meanwhile(self):
+        start = 1_800_000_000
+        with mock.patch.object(lnrouter, 'now', lambda: start):
+            hints = LiquidityHintMgr()
+            for n, number in ((node('a'), 1), (node('b'), 2)):
+                hints.update_cannot_send(n, node('y'), channel(number), amount_msat=1000, policy=(0, 1, 40))
+        # the failures are an hour old, and the clock goes over the second back and forth: whatever it looks
+        # at the clock for, each failure is valid at one look, and expired at the next
+        clock = itertools.cycle((start + HINT_DURATION, start + HINT_DURATION + 1))
+        with mock.patch.object(lnrouter, 'now', lambda: next(clock)):
+            for _ in range(2):
+                state = hints.export_state()
+                for failures in state['nodes'].values():
+                    self.assertTrue(all(failure[:2] == [1000, start] for failure in failures.values()))
+
+    def test_import_of_liquidity_hints_that_are_garbage_takes_over_nothing(self):
+        good = self._record_liquidity(LiquidityHintMgr()).export_state()
+        scid, pair, node_to = channel(1).hex(), good['pairs'][0], node('b').hex()
+        def changed(**kwargs):
+            return {**json.loads(json.dumps(good)), **kwargs}
+        def channel_with(value, *, index=1):
+            amounts = [None] * 6
+            amounts[index] = value
+            return changed(channels={scid: amounts})
+        # the control: this is fine. the channel, and the 4 node pairs and the node of the good ones
+        self.assertEqual(6, LiquidityHintMgr().import_state(channel_with([1000, int(time.time())])))
+        too_much = 21_000_000 * 10**11 + 1
+        for bad in (
+                None, [], {}, 'x', changed(version=2), changed(version='1'),
+                changed(channels=[]), changed(channels={scid: [None] * 5}), changed(channels={scid: [None] * 7}),
+                changed(channels={scid[:-2]: [None] * 6}), changed(channels={'zz': [None] * 6}),
+                channel_with([1, 2, 3]), channel_with([-1, 5]), channel_with(['1000', 5]), channel_with([1000, 5.5]),
+                channel_with([True, 5]), channel_with([1000, -5]), channel_with([too_much, 5]),
+                channel_with([10**400, 5]), channel_with([10**400, 10**18]), channel_with([1000.0, 5], index=0),
+                channel_with([too_much, 5], index=0), channel_with([too_much, 5], index=4),
+                channel_with([too_much, 5], index=5),
+                changed(pairs=[pair[:4]]), changed(pairs=[pair[:4] + [[1000, 100]]]),
+                changed(pairs=[pair[:4] + [[1000, 100, '40']]]), changed(pairs=[[pair[0][:-2]] + pair[1:]]),
+                changed(pairs={'a': 1}), changed(pairs=[pair[:2] + [None, 5] + pair[4:]]),
+                changed(pairs=[pair[:2] + [too_much, 5] + pair[4:]]), changed(pairs=[pair[:4] + [[2**32, 100, 40]]]),
+                changed(pairs=[pair[:4] + [[1000, -1, 40]]]), changed(pairs=[pair[:4] + [[1000, 100, 10**400]]]),
+                changed(nodes=[]), changed(nodes={node_to: []}), changed(nodes={node_to: {'00': [1000, 5]}}),
+                changed(nodes={node_to[:-2]: {}}), changed(nodes={node_to: {node_to: [1000]}}),
+                changed(nodes={node_to: {node_to: [too_much, 5]}}),
+                changed(nodes={node_to: {node_to: [1000, 5, [1000, 100]]}}),
+                changed(nodes={node_to: {node_to: [1000, 5, [1000, 100, 2**32]]}}),
+                changed(nodes={node_to: {node_to: [1000, 5, [1000, 100, 40], 7]}}),
+                changed(nodes={node_to: {node_to: [1000, 5, None]}}),
+        ):
+            hints = LiquidityHintMgr()
+            with self.assertRaises((TypeError, ValueError, KeyError, AttributeError), msg=bad):
+                hints.import_state(bad)
+            self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}}, hints.export_state(), msg=bad)
+        self.assertEqual(10, LiquidityHintMgr().import_state(changed()))
+        # the largest values that are taken do not make the penalty raise
+        hints = LiquidityHintMgr()
+        most = 21_000_000 * 10**11
+        self.assertEqual(2, hints.import_state(changed(
+            channels={scid: [None, [most, int(time.time())], None, None, [most, 5], None]},
+            pairs=[pair[:2] + [most, int(time.time())] + [[2**32 - 1, 2**32 - 1, 2**32 - 1]]], nodes={})))
+        for amount_msat in (1, most - 1, most, 10 * most):
+            for policy in ((0, 0, 0), (2**32 - 1, 2**32 - 1, 2**32 - 1)):
+                for number in (1, 2):
+                    self.assertLessEqual(0, hints.penalty(node('a'), node('b'), channel(number),
+                                                          amount_msat=amount_msat, policy=policy))
+
+    def _liquidity_route(self, number: int):
+        s, a, b = node('s'), node('a'), node('b')
+        return [RouteEdge(start_node=s, end_node=a, short_channel_id=channel(40), fee_base_msat=0,
+                          fee_proportional_millionths=0, cltv_delta=40, node_features=0),
+                RouteEdge(start_node=a, end_node=b, short_channel_id=channel(number), fee_base_msat=1000,
+                          fee_proportional_millionths=100, cltv_delta=40, node_features=0)]
+
+    @staticmethod
+    def _path_finder():
+        # without a graph: these tests do not look for paths
+        return lnrouter.LNPathFinder(mock.Mock(spec=lnrouter.ChannelDB))
+
+    def _cannot_send(self, path_finder, number: int) -> bool:
+        return inf == path_finder.liquidity_hints.penalty(
+            node('a'), node('b'), channel(number), amount_msat=1_000_000, policy=(1000, 100, 40))
+
+    async def test_liquidity_hints_are_saved_and_taken_over_by_the_path_finder_of_a_new_session(self):
+        path_finder = self._path_finder()
+        self.assertEqual({'version': 1, 'channels': {}, 'pairs': [], 'nodes': {}},
+                         json.loads(path_finder.liquidity_hints_to_save()))
+        path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+        path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
+        saved = path_finder.liquidity_hints_to_save()
+        self.assertEqual({channel(40).hex(), channel(42).hex(), channel(43).hex()}, set(json.loads(saved)['channels']))
+        new = self._path_finder()
+        self.assertFalse(self._cannot_send(new, 42))
+        with self.assertLogs('electrum', level='INFO') as logs:
+            new.import_saved_liquidity_hints(saved)
+        self.assertIn('loaded 5 liquidity hints of earlier sessions', '\n'.join(logs.output))  # 3 channels, pair, node
+        self.assertTrue(self._cannot_send(new, 42))
+        self.assertEqual(0, new.liquidity_hints.penalty(
+            node('a'), node('b'), channel(43), amount_msat=500_000, policy=(1000, 100, 40)))
+        new.import_saved_liquidity_hints(None)  # nothing saved yet
+        new.import_saved_liquidity_hints('')
+        self.assertTrue(self._cannot_send(new, 42))
+        new.reset_liquidity_hints()
+        self.assertFalse(self._cannot_send(new, 42))
+
+    async def test_old_failure_is_known_to_the_next_session(self):
+        a, b = node('a'), node('b')
+        policy = (1000, 100, 40)
+        default = LiquidityHintMgr().penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy)
+        start = mock_time = int(time.time())
+        with mock.patch.object(lnrouter, 'now', lambda: mock_time):
+            path_finder = self._path_finder()
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            saved = path_finder.liquidity_hints_to_save()
+            # hours later, as the app that the OS killed gets opened for the next payment
+            age = 3 * HINT_DURATION
+            mock_time = start + age
+            path_finder = self._path_finder()
+            path_finder.import_saved_liquidity_hints(saved)
+            hints = path_finder.liquidity_hints
+            for number in (42, 49):  # the channel that failed, a parallel one
+                self.assertAlmostEqual(
+                    self._old_failure_penalty(default, age),
+                    hints.penalty(a, b, channel(number), amount_msat=1_000_000, policy=policy), delta=0.001)
+            # this session saves it again, as old as it is
+            path_finder.update_liquidity_hints(self._liquidity_route(43), 500_000)
+            saved = path_finder.liquidity_hints_to_save()
+            age = 5 * HINT_DURATION
+            mock_time = start + age
+            path_finder = self._path_finder()
+            path_finder.import_saved_liquidity_hints(saved)
+            self.assertAlmostEqual(
+                self._old_failure_penalty(default, age),
+                path_finder.liquidity_hints.penalty(a, b, channel(42), amount_msat=1_000_000, policy=policy), delta=0.001)
+
+    async def test_saved_liquidity_hints_that_cannot_be_read_are_ignored(self):
+        for garbage in ('not json', '{"version": 99}', '[]', '{}'):
+            path_finder = self._path_finder()
+            with self.assertLogs('electrum', level='WARNING') as logs:
+                path_finder.import_saved_liquidity_hints(garbage)
+            self.assertIn('could not load the liquidity hints', '\n'.join(logs.output))
+            # it goes on working, and what it learns can be saved
+            path_finder.update_liquidity_hints(self._liquidity_route(42), 1_000_000, failing_channel=channel(42))
+            self.assertTrue(self._cannot_send(path_finder, 42))
+            self.assertIn(channel(42).hex(), json.loads(path_finder.liquidity_hints_to_save())['channels'])
 
     def test_reset_liquidity_hints_clears_inflight_htlcs(self):
         liquidity_hints = LiquidityHintMgr()

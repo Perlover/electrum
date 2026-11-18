@@ -451,6 +451,8 @@ Pane {
                                         })
                                         dialog.accepted.connect(function() {
                                             Config.useGossip = true
+                                            if (Network.backgroundRestricted && !Config.gossipBackgroundSyncBatteryAsked)
+                                                app.askUnrestrictedBackground()
                                         })
                                         dialog.rejected.connect(function() {
                                             checked = true // revert
@@ -467,6 +469,108 @@ Pane {
                             Layout.fillWidth: true
                             text: qsTr('Trampoline routing')
                             wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        visible: AppController.isAndroid() && Config.useGossip
+                        Switch {
+                            id: gossipBackgroundSync
+                            onCheckedChanged: {
+                                if (activeFocus) {
+                                    Config.gossipBackgroundSync = checked
+                                    if (checked && Network.backgroundRestricted)
+                                        app.askUnrestrictedBackground()
+                                }
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Update the network graph in the background')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    Label {
+                        Layout.leftMargin: constants.paddingXLarge
+                        visible: AppController.isAndroid() && Config.useGossip && Config.gossipBackgroundSync
+                        text: qsTr('Update every')
+                    }
+
+                    ElComboBox {
+                        id: gossipBackgroundSyncInterval
+                        visible: AppController.isAndroid() && Config.useGossip && Config.gossipBackgroundSync
+                        textRole: 'text'
+                        valueRole: 'value'
+                        model: [
+                            { text: qsTr('1 hour'), value: 60 },
+                            { text: qsTr('2 hours'), value: 120 },
+                            { text: qsTr('4 hours'), value: 240 },
+                            { text: qsTr('8 hours'), value: 480 }
+                        ]
+                        onCurrentValueChanged: {
+                            if (activeFocus)
+                                Config.gossipBackgroundSyncInterval = currentValue
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: constants.paddingXLarge
+                        spacing: 0
+                        visible: AppController.isAndroid() && Config.useGossip && Config.gossipBackgroundSync
+                        Switch {
+                            id: gossipBackgroundSyncUnmeteredOnly
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.gossipBackgroundSyncUnmeteredOnly = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Only on unmetered networks (Wi-Fi)')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: constants.paddingXLarge
+                        spacing: 0
+                        visible: AppController.isAndroid() && Config.useGossip && Config.gossipBackgroundSync
+                        Switch {
+                            id: gossipBackgroundSyncChargingOnly
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.gossipBackgroundSyncChargingOnly = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Only while charging')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        Layout.leftMargin: constants.paddingXLarge
+                        visible: Network.backgroundRestricted
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Android restricts this app in the background: updates can be hours late.')
+                            color: constants.colorWarning
+                            wrapMode: Text.Wrap
+                        }
+                        Button {
+                            text: qsTr('Allow')
+                            onClicked: Network.requestUnrestrictedBackground()
                         }
                     }
 
@@ -527,6 +631,43 @@ Pane {
                             wrapMode: Text.Wrap
                         }
                     }
+
+                    RowLayout {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        spacing: 0
+                        visible: AppController.isAndroid()
+                        Switch {
+                            id: writeLogsToDisk
+                            onCheckedChanged: {
+                                if (activeFocus)
+                                    Config.writeLogsToDisk = checked
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: qsTr('Write a log file, to send it to the developers if something goes wrong')
+                            wrapMode: Text.Wrap
+                        }
+                    }
+
+                    Button {
+                        Layout.columnSpan: 2
+                        Layout.fillWidth: true
+                        visible: AppController.isAndroid() && writeLogsToDisk.checked
+                        text: qsTr('Share log file')
+                        onClicked: {
+                            var dialog = app.messageDialog.createObject(app, {
+                                title: qsTr('Share log file'),
+                                text: qsTr('The file will contain the part of the log about Lightning payments and the network graph: amounts, times, fees, routes and errors. Node ids, channels, invoices, payment hashes and secrets, transactions, addresses, IP addresses and the names of your wallets are replaced by labels that cannot be turned back into them: the same value gets the same label, also in the logs you share later. On Android 10 and later, a copy is saved in Downloads. Send it only to the developers.'),
+                                yesno: true
+                            })
+                            dialog.accepted.connect(function() {
+                                AppController.shareLogFile()
+                            })
+                            dialog.open()
+                        }
+                    }
                 }
             }
         }
@@ -544,7 +685,12 @@ Pane {
         spendUnconfirmed.checked = Config.spendUnconfirmed
         freezeReusedAddressUtxos.checked = Config.freezeReusedAddressUtxos
         useTrampolineRouting.checked = !Config.useGossip
+        gossipBackgroundSync.checked = Config.gossipBackgroundSync
+        gossipBackgroundSyncInterval.currentIndex = gossipBackgroundSyncInterval.indexOfValue(Config.gossipBackgroundSyncInterval)
+        gossipBackgroundSyncUnmeteredOnly.checked = Config.gossipBackgroundSyncUnmeteredOnly
+        gossipBackgroundSyncChargingOnly.checked = Config.gossipBackgroundSyncChargingOnly
         enableDebugLogs.checked = Config.enableDebugLogs
+        writeLogsToDisk.checked = Config.writeLogsToDisk
         disableScreenshots.checked = !Config.alwaysAllowScreenshots && AppController.isAndroid()
         setMaxBrightnessOnQrDisplay.checked = Config.setMaxBrightnessOnQrDisplay && AppController.isAndroid()
         useRecoverableChannels.checked = Config.useRecoverableChannels

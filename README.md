@@ -34,3 +34,15 @@ Classic has a single dark look, so it has one column. "—" means the screen is 
 ¹ The classic Send dialog opens the QR scanner first, and the desktop setup used here has no camera.
 
 ² Classic leaves the status bar black, and with a light system theme its icons are dark, so they cannot be seen.
+
+## Together with the Lightning routing patches
+
+- **Rows 12–13** — the same Android 14 emulator, a new empty wallet, no network; the APK is built from the branch
+  [`material3-routing`](https://github.com/Perlover/electrum/tree/material3-routing): this PR together with our open
+  Lightning routing PRs. The settings those PRs add to the classic Preferences are shown in Material 3 (commit
+  `a90ad0b71` of that branch).
+
+| # | Screen | Material 3, light | Material 3, dark | Classic |
+|---|---|---|---|---|
+| 12 | Settings → Lightning: background updates of the network graph, with the battery restriction warning | ![](12-android14-routing-settings-m3-light.png) | ![](12-android14-routing-settings-m3-dark.png) | — |
+| 13 | Settings → Advanced → Share log file: what the file contains, asked before anything is shared | ![](13-android14-share-log-m3-light.png) | — | — |

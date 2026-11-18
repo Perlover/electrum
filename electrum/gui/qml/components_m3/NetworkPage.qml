@@ -25,6 +25,8 @@ import "controls"
 // instead of white, so they show in the light theme.
 // Strings keep the translation context of the classic file (qsTranslate('NetworkOverview', ...)); the classic
 // labels that end with ':' are shown without it.
+// repeats: components/NetworkOverview.qml:220-223 (when the graph was last updated in the background, as a fourth
+// line of Gossip, only when there is a value) @ 88c6ff1bd.
 M3Page {
     id: root
     objectName: 'NetworkOverview'
@@ -241,7 +243,9 @@ M3Page {
                         qsTranslate('NetworkOverview', '%1 peers').arg(Network.gossipInfo.peers),
                         qsTranslate('NetworkOverview', '%1 channels to fetch').arg(Network.gossipInfo.unknown_channels),
                         qsTranslate('NetworkOverview', '%1 nodes, %2 channels').arg(Network.gossipInfo.db_nodes).arg(Network.gossipInfo.db_channels)
-                    ].join('\n')
+                    ].concat(Network.gossipInfo.last_background_catch_up != ''
+                        ? [qsTranslate('NetworkOverview', 'updated in the background %1').arg(Network.gossipInfo.last_background_catch_up)]
+                        : []).join('\n')
                 }
                 M3DetailRow {
                     visible: !Config.useGossip

@@ -14,6 +14,10 @@ import "controls"
 // repeats: components/Preferences.qml:44-492 (settings, conditions, confirmations), :497-514
 // (initial values) @ 4f36c4489; the language restart dialog repeats the form of
 // components_m3/main.qml showRestartDialog() (interface style).
+// repeats: components/Preferences.qml:416-417 (the battery question after the graph is turned on),
+// :437-537 (the background updates of the network graph and the warning while Android restricts the app),
+// :597-632 (the log file and its sharing: the explanation first, the file only after Yes), :649-654 (initial
+// values) @ 88c6ff1bd.
 //
 // Every control SHOWS a binding to the backend property and WRITES only on a user action
 // (userToggled / selected / moved / activated), so opening the screen writes nothing, and a write
@@ -380,7 +384,91 @@ Item {
                         } else {
                             root._confirm(qsTranslate('Preferences', 'Are you sure?'),
                                 qsTranslate('Preferences', 'Electrum will have to download the Lightning Network graph, which is not recommended on mobile.'),
-                                function() { Config.useGossip = true })
+                                function() {
+                                    Config.useGossip = true
+                                    if (Network.backgroundRestricted && !Config.gossipBackgroundSyncBatteryAsked)
+                                        app.askUnrestrictedBackground()
+                                })
+                        }
+                    }
+                }
+
+                // the updates of the network graph while the app is not in use (Android only); the rows that
+                // depend on the switch are indented
+                M3SwitchRow {
+                    visible: root._isAndroid && Config.useGossip
+                    headline: qsTranslate('Preferences', 'Update the network graph in the background')
+                    headlineMaxLines: 2
+                    checked: Config.gossipBackgroundSync
+                    onUserToggled: (checked) => {
+                        Config.gossipBackgroundSync = checked
+                        if (checked && Network.backgroundRestricted)
+                            app.askUnrestrictedBackground()
+                    }
+                }
+
+                M3SelectRow {
+                    visible: root._isAndroid && Config.useGossip && Config.gossipBackgroundSync
+                    leftPadding: m3.space16 + m3.space24
+                    headline: qsTranslate('Preferences', 'Update every')
+                    model: [
+                        { text: qsTranslate('Preferences', '1 hour'), value: 60 },
+                        { text: qsTranslate('Preferences', '2 hours'), value: 120 },
+                        { text: qsTranslate('Preferences', '4 hours'), value: 240 },
+                        { text: qsTranslate('Preferences', '8 hours'), value: 480 }
+                    ]
+                    currentValue: Config.gossipBackgroundSyncInterval
+                    onSelected: (value) => {
+                        if (value != Config.gossipBackgroundSyncInterval)
+                            Config.gossipBackgroundSyncInterval = value
+                    }
+                }
+
+                M3SwitchRow {
+                    visible: root._isAndroid && Config.useGossip && Config.gossipBackgroundSync
+                    leftPadding: m3.space16 + m3.space24
+                    headline: qsTranslate('Preferences', 'Only on unmetered networks (Wi-Fi)')
+                    headlineMaxLines: 2
+                    checked: Config.gossipBackgroundSyncUnmeteredOnly
+                    onUserToggled: (checked) => { Config.gossipBackgroundSyncUnmeteredOnly = checked }
+                }
+
+                M3SwitchRow {
+                    visible: root._isAndroid && Config.useGossip && Config.gossipBackgroundSync
+                    leftPadding: m3.space16 + m3.space24
+                    headline: qsTranslate('Preferences', 'Only while charging')
+                    headlineMaxLines: 2
+                    checked: Config.gossipBackgroundSyncChargingOnly
+                    onUserToggled: (checked) => { Config.gossipBackgroundSyncChargingOnly = checked }
+                }
+
+                // shown while the OS restricts the app in the background (Network.backgroundRestricted is false
+                // unless the background updates are on); "Allow" opens the battery settings of the OS
+                // (an Item, not margins of the layout: the divider of the group is drawn at the top of the row)
+                Item {
+                    visible: Network.backgroundRestricted
+                    Layout.fillWidth: true
+                    implicitHeight: restrictedColumn.implicitHeight + 2 * m3.space8
+
+                    ColumnLayout {
+                        id: restrictedColumn
+                        x: m3.space16 + m3.space24
+                        y: m3.space8
+                        width: parent.width - x - m3.space16
+                        spacing: m3.space4
+
+                        M3InfoText {
+                            Layout.fillWidth: true
+                            compact: true
+                            iconStyle: M3InfoText.IconStyle.Warn
+                            textFormat: Text.PlainText
+                            text: qsTranslate('Preferences', 'Android restricts this app in the background: updates can be hours late.')
+                        }
+                        M3Button {
+                            Layout.alignment: Qt.AlignRight
+                            variant: 'text'
+                            text: qsTranslate('Preferences', 'Allow')
+                            onClicked: Network.requestUnrestrictedBackground()
                         }
                     }
                 }
@@ -431,6 +519,33 @@ Item {
                     enabled: Config.canToggleDebugLogs
                     checked: Config.enableDebugLogs
                     onUserToggled: (checked) => { Config.enableDebugLogs = checked }
+                }
+
+                M3SwitchRow {
+                    visible: root._isAndroid
+                    headline: qsTranslate('Preferences', 'Write a log file, to send it to the developers if something goes wrong')
+                    headlineMaxLines: 3
+                    checked: Config.writeLogsToDisk
+                    onUserToggled: (checked) => { Config.writeLogsToDisk = checked }
+                }
+
+                // first what the file contains, the file is shared only after Yes
+                M3ListItem {
+                    visible: root._isAndroid && Config.writeLogsToDisk
+                    leftPadding: m3.space16 + m3.space24
+                    headline: qsTranslate('Preferences', 'Share log file')
+                    leadingIcon: Qt.resolvedUrl('../../icons/m3/share.png')
+                    onClicked: {
+                        var dialog = app.messageDialog.createObject(app, {
+                            title: qsTranslate('Preferences', 'Share log file'),
+                            text: qsTranslate('Preferences', 'The file will contain the part of the log about Lightning payments and the network graph: amounts, times, fees, routes and errors. Node ids, channels, invoices, payment hashes and secrets, transactions, addresses, IP addresses and the names of your wallets are replaced by labels that cannot be turned back into them: the same value gets the same label, also in the logs you share later. On Android 10 and later, a copy is saved in Downloads. Send it only to the developers.'),
+                            yesno: true
+                        })
+                        dialog.accepted.connect(function() {
+                            AppController.shareLogFile()
+                        })
+                        dialog.open()
+                    }
                 }
             }
 

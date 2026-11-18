@@ -40,7 +40,8 @@ Classic has a single dark look, so it has one column. "—" means the screen is 
 - **Rows 12–13** — the same Android 14 emulator, a new empty wallet, no network; the APK is built from the branch
   [`material3-routing`](https://github.com/Perlover/electrum/tree/material3-routing): this PR together with our open
   Lightning routing PRs. The settings those PRs add to the classic Preferences are shown in Material 3 (commit
-  `a90ad0b71` of that branch).
+  `dfe9e057c` of that branch). The APK was built from the same code on the older master these branches were started from
+  (`4f36c4489`); the branch itself is on the current master.
 
 | # | Screen | Material 3, light | Material 3, dark | Classic |
 |---|---|---|---|---|
